@@ -1,0 +1,50 @@
+{
+  "name": "@termlink/terminal",
+  "version": "0.1.2",
+  "description": "A shell in a PTY with a headless screen for reconnects. Knows nothing about hosts or clients.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "node --conditions=source --import tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "tsc -b"
+  },
+  "dependencies": {
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0"
+  },
+  "optionalDependencies": {
+    "@lydell/node-pty": "^1.2.0-beta.15"
+  },
+  "license": "MIT",
+  "author": "Bert Shim",
+  "homepage": "https://getterm.link",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bertshim/termlink-cli.git",
+    "directory": "packages/terminal"
+  },
+  "bugs": {
+    "url": "https://github.com/bertshim/termlink-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "termlink",
+    "pty",
+    "terminal"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

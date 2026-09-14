@@ -1,0 +1,26 @@
+{
+  "name": "termlink-cli",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "packages/terminal",
+    "packages/host"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "npm run test --workspaces",
+    "dev": "npm run dev -w @termlink/cli --",
+    "demo": "npm run demo -w @termlink/cli --"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

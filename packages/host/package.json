@@ -1,0 +1,65 @@
+{
+  "name": "@termlink/cli",
+  "version": "0.1.2",
+  "description": "TermLink: terminals, Claude Code and Codex sessions on your machine, reachable from the TermLink web app",
+  "type": "module",
+  "bin": {
+    "termlink": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "node --conditions=source --import tsx src/cli.ts start",
+    "demo": "node --conditions=source --import tsx scripts/demo-client.ts",
+    "relay-smoke": "node --conditions=source --import tsx scripts/relay-smoke.ts",
+    "bench": "node --conditions=source --import tsx scripts/latency-bench.ts",
+    "test": "node --conditions=source --import tsx --test \"test/**/*.test.ts\"",
+    "codex:types": "codex app-server generate-ts --out node_modules/.codex-types",
+    "bundle": "node scripts/build.mjs",
+    "prepublishOnly": "tsc -b && node scripts/bake-oauth.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.268",
+    "@termlink/protocol": "^0.1.2",
+    "@termlink/terminal": "^0.1.2",
+    "diff": "^9.0.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "license": "MIT",
+  "author": "Bert Shim",
+  "homepage": "https://getterm.link",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bertshim/termlink-cli.git",
+    "directory": "packages/host"
+  },
+  "bugs": {
+    "url": "https://github.com/bertshim/termlink-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "termlink",
+    "terminal",
+    "claude",
+    "codex",
+    "pty",
+    "remote"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

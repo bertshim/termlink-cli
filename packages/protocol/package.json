@@ -1,0 +1,42 @@
+{
+  "name": "@termlink/protocol",
+  "version": "0.1.2",
+  "description": "TermLink agent protocol: command, response and event schemas shared by host and clients",
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "node --conditions=source --import tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "tsc -b"
+  },
+  "dependencies": {
+    "zod": "^4.6.2"
+  },
+  "license": "MIT",
+  "author": "Bert Shim",
+  "homepage": "https://getterm.link",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bertshim/termlink-cli.git",
+    "directory": "packages/protocol"
+  },
+  "bugs": {
+    "url": "https://github.com/bertshim/termlink-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "termlink",
+    "protocol"
+  ]
+}
