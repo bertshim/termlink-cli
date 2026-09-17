@@ -192,6 +192,56 @@ test("Claude: a message too late to fold runs as its own turn afterwards", async
     const ends = rec.items.filter(isType("turn.completed"));
     assert.deepEqual(ends.map((e) => e.payload.turnId), starts.map((e) => e.payload.turnId));
     assert.equal(session.info.status, "idle");
+    // Its own turn's first frame named it: read, not left queued.
+    assert.equal(session.info.queued, 0);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("Claude: a slash command sent mid-turn goes as typed, runs after the turn, and is not left queued", async () => {
+  const { provider, log } = fakeClaude();
+  const { manager, session, rec } = await open(provider);
+  try {
+    await session.send({ text: "run the tests" });
+    const required = (await rec.waitFor(isType("input.required"))) as EventOf<"input.required">;
+    await session.send({ text: "/model sonnet", id: "m-cmd" });
+    // Nothing added: the note would become the command's arguments.
+    assert.equal(log.inputs.at(-1)?.message.content, "/model sonnet");
+    assert.equal(session.info.queued, 1);
+
+    session.respond(required.payload.request.requestId, "allow");
+    // Claude Code runs the command once the turn is over; its result names it.
+    await rec.waitFor((e) => e.type === "item.completed" && e.payload.item.id === "m-cmd" && e.payload.item.kind === "message" && e.payload.item.steer === "read");
+    assert.deepEqual(steerStates(rec.items, "m-cmd"), ["queued", "read"]);
+    assert.equal(session.info.queued, 0);
+    // A command is no turn of its own.
+    assert.equal(rec.items.filter(isType("turn.started")).length, 1);
+    assert.equal(session.info.status, "idle");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("Claude: a queued message no frame names is settled once a later message is taken", async () => {
+  const { provider } = fakeClaude();
+  const { manager, session, rec } = await open(provider);
+  try {
+    await session.send({ text: "run the tests" });
+    const required = (await rec.waitFor(isType("input.required"))) as EventOf<"input.required">;
+    await session.send({ text: "a silent one", id: "m-silent" });
+    session.respond(required.payload.request.requestId, "allow");
+    await rec.waitFor(isType("turn.completed"));
+    await sleep(30);
+    // Taken without a word: nothing has named it yet.
+    assert.equal(session.info.queued, 1);
+
+    const before = rec.items.length;
+    await session.send({ text: "hello quick" });
+    await rec.waitFor(isType("turn.completed"), before);
+    // The next message was taken, so the one queued before it was too.
+    assert.deepEqual(steerStates(rec.items, "m-silent"), ["queued", "read"]);
+    assert.equal(session.info.queued, 0);
   } finally {
     await manager.shutdown();
   }

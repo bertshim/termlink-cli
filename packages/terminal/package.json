@@ -1,6 +1,6 @@
 {
   "name": "@termlink/terminal",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A shell in a PTY with a headless screen for reconnects. Knows nothing about hosts or clients.",
   "type": "module",
   "exports": {

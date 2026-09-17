@@ -16,7 +16,9 @@ This repository is the source of the npm packages
 ## Install and run
 
 Requires Node.js 22 or later. Nothing is compiled on your machine: the PTY binary comes prebuilt
-for Windows, macOS and Linux (x64 and arm64).
+for Windows, macOS and Linux (x64 and arm64). npm only warns (`EBADENGINE`) when an older
+Node.js installs the package; `termlink` itself checks at start and says which Node.js it found
+and how to update.
 
 ```sh
 npm install -g @termlink/cli
@@ -43,6 +45,13 @@ Useful options for `start`:
 - `--providers terminal,claude,codex`: which session kinds to offer (this is the default)
 - `--shell <path>`: the shell for terminal sessions (default: your shell; PowerShell on Windows)
 - `--auto-approve edits|all`: let new agent sessions answer file or command approvals themselves
+- `--verbose`: print the relay connection details as they happen
+
+While it runs, the host lists sessions as they open and close and keeps a status line at
+the bottom: the relay connection, how many sessions are open and how to stop. Its dots move
+once a second, so you can tell it is alive. It does not print addresses or tokens. Keep the
+window open while you use TermLink, and stop the host with Ctrl+C: agent sessions are saved
+and come back on the next start; terminal sessions end with the host.
 
 The host does not handle Claude or Codex credentials. Sign in with those tools directly
 (`claude`, `codex login`); the host only checks that you did.

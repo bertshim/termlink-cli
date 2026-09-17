@@ -28,7 +28,14 @@ export interface RelayHostOptions {
   minBackoffMs?: number;
   maxBackoffMs?: number;
   pingIntervalMs?: number;
+  /** Connection details as they happen, for --verbose. They name relay addresses. */
   log?: (line: string) => void;
+  /**
+   * The connection as a person needs it: "connected" once a socket is open, "disconnected"
+   * when one drops and a reconnect is under way, "stopped" when it has ended for good.
+   * Carries no addresses.
+   */
+  onStatus?: (status: "connected" | "disconnected" | "stopped") => void;
   /** The relay connection ended for good: the session was ended from the account, or sign-in is needed. */
   onStopped?: (reason: string) => void;
 }
@@ -143,12 +150,16 @@ export class RelayHost {
       if (status === "401" || status === "403") this.#hostToken = null;
       this.#log(`relay: ${err.message}`);
     });
+    // Only a socket that opened can be lost; a dial that never got through is just retried.
+    let opened = false;
     ws.on("open", () => {
+      opened = true;
       this.#backoffMs = this.#options.minBackoffMs ?? 1_000;
       this.#lastLogged = "";
       this.#log(`relay: connected to ${this.relayUrl} as ${this.#options.session}`);
       this.#serve(ws);
       this.#markReady();
+      this.#options.onStatus?.("connected");
     });
     ws.on("close", (code, reason) => {
       if (this.#socket === ws) {
@@ -157,6 +168,7 @@ export class RelayHost {
       }
       if (this.#stopped) return;
       this.#log(`relay: disconnected (${code}${reason.length > 0 ? ` ${reason.toString()}` : ""}), reconnecting`);
+      if (opened) this.#options.onStatus?.("disconnected");
       this.#scheduleReconnect();
     });
   }
@@ -243,6 +255,7 @@ export class RelayHost {
     this.#stopped = true;
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#log(`relay: stopped: ${reason}`);
+    this.#options.onStatus?.("stopped");
     this.#teardown();
     this.#socket?.close(1000, "host stopped");
     this.#options.onStopped?.(reason);

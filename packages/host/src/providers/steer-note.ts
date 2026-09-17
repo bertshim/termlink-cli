@@ -9,6 +9,9 @@ export const STEER_NOTE =
 
 export const withSteerNote = (text: string): string => `${text.replace(/\s+$/, "")}\n\n${STEER_NOTE}`;
 
+/** A message the agent's CLI takes as a command (`/model`, `/usage`), not as words to Claude. */
+export const isSlashCommand = (text: string): boolean => /^\/[A-Za-z]/.test(text.trimStart());
+
 export function stripSteerNote(text: string): string {
   const at = text.lastIndexOf(STEER_NOTE);
   return at < 0 ? text : text.slice(0, at).replace(/\s+$/, "");

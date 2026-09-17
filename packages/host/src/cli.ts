@@ -16,6 +16,7 @@ import { DEFAULT_SERVER, RelayHost, defaultRelaySession } from "./relay/relay-ho
 import { startLocalServer } from "./server/local-server.js";
 import { SessionManager } from "./session/manager.js";
 import { SessionStore, defaultStatePath } from "./session/store.js";
+import { HostConsole, sessionEventLine, type RelayState } from "./ui/console.js";
 import { newId } from "./util/id.js";
 import { LockHeldError, acquirePidLock } from "./util/lock.js";
 import { VERSION } from "./version.js";
@@ -23,6 +24,7 @@ import { VERSION } from "./version.js";
 const APPROVAL_POLICIES = ["untrusted", "on-request", "never"] as const;
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
 const DEFAULT_PROVIDERS = "terminal,claude,codex";
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
 
 const USAGE = `Usage: termlink <command> [options]
 
@@ -39,6 +41,8 @@ Options for start:
   --port <n>                      local WebSocket port (default 7420)
   --host <addr>                   bind address (default 127.0.0.1)
   --token <token>                 local client token (default: $TERMLINK_LOCAL_TOKEN or a random one)
+  --show-local-url                print the local WebSocket URL with its token (for development)
+  --verbose                       print the relay connection details as they happen
   --relay-session <name>          relay session name (default: ${defaultRelaySession()})
   --allow-root <dir>              folder sessions may open in; repeatable
                                   (default: the current folder)
@@ -78,6 +82,8 @@ async function main(): Promise<void> {
       port: { type: "string", default: "7420" },
       host: { type: "string", default: "127.0.0.1" },
       token: { type: "string" },
+      "show-local-url": { type: "boolean", default: false },
+      verbose: { type: "boolean", default: false },
       server: { type: "string" },
       "relay-session": { type: "string" },
       "allow-root": { type: "string", multiple: true },
@@ -130,6 +136,8 @@ type Values = {
   port: string;
   host: string;
   token?: string | undefined;
+  "show-local-url": boolean;
+  verbose: boolean;
   "relay-session"?: string | undefined;
   "allow-root"?: string[] | undefined;
   state?: string | undefined;
@@ -164,6 +172,7 @@ async function start(values: Values, server: string, credentialPath: string): Pr
     else if (name === "claude") providers.push(new ClaudeProvider({ permissionMode, model: values["claude-model"] }));
     else throw new Error(`unknown provider: ${name}`);
   }
+  const labels = Object.fromEntries(providers.map((p) => [p.id, p.label]));
 
   const manager = new SessionManager({
     providers,
@@ -184,31 +193,62 @@ async function start(values: Values, server: string, credentialPath: string): Pr
 
   const restored = values["no-restore"] ? 0 : await manager.restore();
   const local = await startLocalServer({ manager, hostInfo, host: values.host, port, token });
-  if (values.host !== "127.0.0.1" && values.host !== "localhost" && values.host !== "::1") {
-    console.warn(`warning: the local server has no TLS and is listening on ${values.host}`);
-  }
-  console.log(`termlink ${VERSION} listening on ${local.url}?token=${token}`);
+
+  let relayState: RelayState = "connecting";
+  let stopping = false;
+  const ui = new HostConsole({
+    labels,
+    status: () => ({ version: VERSION, relay: relayState, sessions: manager.list(), stopping }),
+  });
+
+  // What the host does, not where it can be reached: no addresses, ports or tokens
+  // unless asked for with --show-local-url.
+  ui.print(`termlink ${VERSION}`);
+  ui.print(
+    LOOPBACK.has(values.host)
+      ? "  Local server: ready, for this computer only"
+      : "  Local server: ready, reachable from other machines and without TLS (--host)",
+  );
+  if (values["show-local-url"]) ui.print(`  Local URL: ${local.url}?token=${token}`);
   for (const status of await manager.providerStatuses()) {
     const state = status.available ? "ready" : "unavailable";
-    console.log(`  ${status.id}: ${state}${status.detail ? ` (${status.detail})` : ""}`);
+    ui.print(`  ${status.label}: ${state}${status.detail ? ` (${status.detail})` : ""}`);
   }
-  if (manager.roots) console.log(`  sessions may open in: ${manager.roots.join(", ")}`);
-  if (autoApprove && autoApprove !== "off") console.log(`  new agent sessions auto-approve: ${autoApprove}`);
-  if (restored > 0) console.log(`  restored ${restored} session${restored === 1 ? "" : "s"}`);
+  if (manager.roots) ui.print(`  Sessions open in: ${manager.roots.join(", ")}`);
+  if (autoApprove && autoApprove !== "off") ui.print(`  New agent sessions auto-approve: ${autoApprove}`);
+  if (restored > 0) ui.print(`  Restored ${restored} agent session${restored === 1 ? "" : "s"} from the last run`);
+  ui.print();
+  ui.print("Keep this window open while you use TermLink: closing it ends the terminal sessions running here.");
+  ui.print("Stop with Ctrl+C. Agent sessions are saved and come back when the host starts again.");
+  ui.print();
+
+  // Sessions opening and closing, one line each. Anything else about a session (a turn
+  // starting or ending) only changes the counts on the status line.
+  manager.onHostEvent((event) => {
+    if (!event.type.startsWith("session.")) return;
+    const line = stopping ? null : sessionEventLine(event, labels);
+    if (line) ui.event(line);
+    else ui.refresh();
+  });
 
   let relay: RelayHost | null = null;
   let releaseLock: (() => Promise<void>) | null = null;
-  let stopping = false;
-  const stop = async (): Promise<void> => {
+  const stop = async (why?: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
+    if (why) ui.event(why);
+    ui.event("Stopping: saving agent sessions and closing terminals. Press Ctrl+C again to quit at once.");
     await relay?.close();
     await releaseLock?.();
     await manager.shutdown("host shutting down");
     await local.close();
+    ui.stop();
+    ui.print("Stopped.");
   };
+  // Once each: a second Ctrl+C falls through to Node's default and quits at once.
   process.once("SIGINT", () => void stop());
   process.once("SIGTERM", () => void stop());
+  ui.start();
 
   const session = values["relay-session"] ?? defaultRelaySession();
   try {
@@ -224,10 +264,17 @@ async function start(values: Values, server: string, credentialPath: string): Pr
       name: os.hostname(),
       cwd: manager.roots?.[0] ?? process.cwd(),
       credentialPath,
-      log: (line) => console.log(`${new Date().toLocaleTimeString("en-GB")} ${line}`),
-      onStopped: () => void stop(),
+      ...(values.verbose ? { log: (line: string) => ui.event(line) } : {}),
+      onStatus: (status) => {
+        relayState = status === "connected" ? "online" : status === "disconnected" ? "reconnecting" : "offline";
+        if (status === "connected") ui.event("Connected to the TermLink relay: this machine is online in the web app");
+        else if (status === "disconnected") ui.event("Lost the connection to the TermLink relay; reconnecting");
+        else ui.refresh();
+      },
+      onStopped: (reason) => void stop(`The TermLink service ended this host: ${reason}`),
     });
   } catch (err) {
+    ui.stop();
     if (err instanceof LockHeldError) {
       console.error(
         `another termlink host (pid ${err.pid}) is already on relay session ${session}; ` +

@@ -47,6 +47,10 @@ Sessions open only inside the allowed folders: the folder the host was started i
 given with `--allow-root`. Paths are compared after resolving symbolic links. This limits where a
 session starts; it does not confine a shell or an agent, which can reach anything your user can.
 
+Clients can also browse those folders and read a file in them, up to 10 MiB, to preview a file
+an agent mentioned (`fs.list`, `fs.read`). Reading includes hidden files such as `.env`, so start
+the host in the folder you mean to work in rather than in your home folder.
+
 ### Approvals
 
 Agent tool calls ask for approval according to the agent's own settings. `--auto-approve` and a

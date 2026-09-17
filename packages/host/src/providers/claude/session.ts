@@ -23,7 +23,7 @@ import {
   traceTool,
 } from "../../util/trace.js";
 import { VERSION } from "../../version.js";
-import { withSteerNote } from "../steer-note.js";
+import { isSlashCommand, withSteerNote } from "../steer-note.js";
 import type { EventSink, ProviderSession, UserInput } from "../types.js";
 import { InputQueue } from "./input-queue.js";
 import { completeToolItem, mapToolUse, type ToolResult } from "./mapper.js";
@@ -45,6 +45,8 @@ export const AUTH_RETRY_DELAYS_MS: readonly number[] = [3_000, 8_000];
  * It ends the turn with this before anything reaches the API; the next try usually works.
  */
 const AUTH_REFRESH_RACE = /Failed to refresh OAuth token/i;
+/** How many sent-but-not-yet-taken message uuids are remembered; far more than ever wait at once. */
+const MAX_PUSHED = 500;
 
 // Content blocks and stream events are read structurally; the SDK types them
 // through the Anthropic API client, and only a few fields matter here.
@@ -126,6 +128,8 @@ export class ClaudeSession implements ProviderSession {
   readonly #requests = new Set<AbortController>();
   /** Messages steered into the turn and not yet read, by the uuid they were pushed with. */
   readonly #steered = new Map<string, string>();
+  /** Uuids of the user messages written to Claude Code and not yet taken, in the order they went. */
+  #pushed: string[] = [];
   #messageId: string | null = null;
   #turnId: string | null = null;
   #turnCount = 0;
@@ -199,7 +203,7 @@ export class ClaudeSession implements ProviderSession {
     if (TRACE) traceMark(this.#traceId, "push");
     // Written to the process's stdin at once, whether or not it has finished starting:
     // Claude Code queues it and runs it as soon as it is up.
-    this.#link.input.push({ type: "user", message: { role: "user", content: input.text }, parent_tool_use_id: null });
+    this.#push(this.#link, input.text);
   }
 
   /**
@@ -213,24 +217,45 @@ export class ClaudeSession implements ProviderSession {
     if (!this.#turnId) return this.send(input);
     // The uuid comes back on the first reply frame after Claude Code folds the
     // message in (user_message_uuids): that is when Claude has read it.
-    const uuid = randomUUID();
+    // A slash command goes as typed: Claude Code runs it after the turn, and anything
+    // added would become the command's arguments (the note once became a model name).
+    const content = isSlashCommand(input.text) ? input.text : withSteerNote(input.text);
+    const uuid = this.#push(this.#link, content, "next");
     this.#steered.set(uuid, itemId);
-    this.#link.input.push({
-      type: "user",
-      message: { role: "user", content: withSteerNote(input.text) },
-      parent_tool_use_id: null,
-      uuid,
-      priority: "next",
-    });
   }
 
-  /** Steered messages this frame says the turn has consumed, reported as read. */
+  /** Writes a user message to Claude Code, stamped with a uuid its frames will name once it is taken. */
+  #push(link: Link, content: string, priority?: "next"): string {
+    const uuid = randomUUID();
+    this.#pushed.push(uuid);
+    if (this.#pushed.length > MAX_PUSHED) this.#pushed.splice(0, this.#pushed.length - MAX_PUSHED);
+    link.input.push({
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      uuid,
+      ...(priority ? { priority } : {}),
+    });
+    return uuid;
+  }
+
+  /**
+   * Steered messages Claude Code has taken, reported as read. A reply frame names the
+   * messages its turn has taken in (user_message_uuids): one folded into the turn, or one
+   * that runs as a turn of its own. A slash command names its message on its result
+   * instead, with no reply frames at all. And Claude Code takes queued messages in the
+   * order they came, so once a message is named, every one pushed before it has been
+   * taken too, named or not: none is left queued behind a later one.
+   */
   #noteRead(message: SDKMessage): void {
-    if (this.#steered.size === 0 || (message.type !== "assistant" && message.type !== "stream_event")) return;
-    if (message.parent_tool_use_id !== null) return;
+    if (message.type !== "assistant" && message.type !== "stream_event" && message.type !== "result") return;
+    if (message.type !== "result" && message.parent_tool_use_id !== null) return;
     const m = message as unknown as { user_message_uuid?: string; user_message_uuids?: string[] };
     const uuids = m.user_message_uuids ?? (m.user_message_uuid ? [m.user_message_uuid] : []);
-    for (const uuid of uuids) {
+    let last = -1;
+    for (const uuid of uuids) last = Math.max(last, this.#pushed.indexOf(uuid));
+    if (last < 0) return;
+    for (const uuid of this.#pushed.splice(0, last + 1)) {
       const itemId = this.#steered.get(uuid);
       if (!itemId) continue;
       this.#steered.delete(uuid);
@@ -337,6 +362,8 @@ export class ClaudeSession implements ProviderSession {
     if (this.#link !== link || this.#closing) return;
     if (!this.#hasTranscript) this.#sessionId = randomUUID();
     if (TRACE) traceLine(`${this.#traceId} restarting claude (${this.#hasTranscript ? "resume" : "fresh"}): ${reason}`);
+    // The new process has none of the old one's queue.
+    this.#pushed = [];
     this.#link = this.#connect(this.#hasTranscript);
     link.input.end();
     link.query.close();
@@ -538,7 +565,7 @@ export class ClaudeSession implements ProviderSession {
       if (this.#turnId !== turnId || this.#link !== link || this.#interrupting || this.#closing || this.#dead) return;
       // A message steered in meanwhile is already queued in Claude Code and carries the turn on.
       if (this.#steered.size > 0 || text === null) return;
-      link.input.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
+      this.#push(link, text);
     }, delay);
   }
 

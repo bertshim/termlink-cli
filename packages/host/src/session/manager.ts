@@ -1,6 +1,7 @@
-import { readdir, realpath, stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { FS_READ_MAX_BYTES } from "@termlink/protocol";
 import type { AgentEvent, AutoApprove, CommandResults, ProviderId, ProviderStatus, SessionInfo } from "@termlink/protocol";
 import { HostError, errorMessage } from "../errors.js";
 import type { HostProvider, ProviderAdapter, TerminalProvider } from "../providers/types.js";
@@ -361,6 +362,43 @@ export class SessionManager {
     return { path: real, parent, entries };
   }
 
+  /**
+   * A file's own bytes (protocol `fs.read`), for a client previewing a path an agent
+   * mentioned in its reply: a screenshot it saved, a report it wrote. The same
+   * allowed-folder check as `#resolveCwd` and `listDirectory`, after resolving symlinks,
+   * so `termlink start` (which always has allowed folders) serves nothing outside them.
+   * Hidden files inside them are served too. One reply of up to FS_READ_MAX_BYTES,
+   * whose base64 reassembles within FrameAssembler's limit: a preview, not a general
+   * file transfer.
+   */
+  async readFile(requested: string): Promise<CommandResults["fs.read"]> {
+    const resolved = path.resolve(this.#roots?.[0] ?? process.cwd(), requested);
+    const real = await realpath(resolved).catch(() => null);
+    const stats = real ? await stat(real).catch(() => null) : null;
+    if (!real || !stats?.isFile()) throw new HostError("bad_request", `not a file: ${resolved}`);
+    if (this.#roots) {
+      const roots = await this.#realRoots();
+      if (!roots.some((root) => isInside(real, root))) {
+        throw new HostError("forbidden", `${resolved} is outside the folders this host allows`);
+      }
+    }
+    if (stats.size > FS_READ_MAX_BYTES) {
+      throw new HostError(
+        "bad_request",
+        `${resolved} is ${formatBytes(stats.size)}, over the ${formatBytes(FS_READ_MAX_BYTES)} preview limit`,
+      );
+    }
+    const data = await readFile(real).catch((err: unknown) => {
+      throw new HostError("internal", `could not read ${real}: ${errorMessage(err)}`);
+    });
+    return {
+      path: real,
+      mimeType: mimeTypeFor(real),
+      size: stats.size,
+      dataBase64: data.toString("base64"),
+    };
+  }
+
   readonly #broadcast = (event: AgentEvent): void => {
     // A session that ended on its own (a shell that exited) is forgotten like a closed one.
     if (event.type === "session.closed" && event.sessionId) this.#sessions.delete(event.sessionId);
@@ -372,4 +410,53 @@ export class SessionManager {
 function isInside(child: string, root: string): boolean {
   const relative = path.relative(root, child);
   return relative === "" || (relative.split(path.sep)[0] !== ".." && !path.isAbsolute(relative));
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let v = bytes / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+/**
+ * By extension, not by sniffing the content: a wrong guess costs a preview drawn the wrong
+ * way, never a security decision. Anything unrecognised is application/octet-stream, which a
+ * client offers as a download instead of rendering.
+ */
+const EXT_MIME: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".bmp": "image/bmp",
+  ".ico": "image/x-icon",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".markdown": "text/markdown",
+  ".json": "application/json",
+  ".csv": "text/csv",
+  ".html": "text/html",
+  ".htm": "text/html",
+  ".xml": "application/xml",
+  ".log": "text/plain",
+  ".yml": "text/yaml",
+  ".yaml": "text/yaml",
+  ".css": "text/css",
+  ".js": "text/javascript",
+  ".ts": "text/plain",
+  ".tsx": "text/plain",
+  ".jsx": "text/plain",
+};
+
+function mimeTypeFor(filePath: string): string {
+  return EXT_MIME[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }

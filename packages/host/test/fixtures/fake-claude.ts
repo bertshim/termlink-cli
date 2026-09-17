@@ -24,6 +24,9 @@ const textOf = (message: SDKUserMessage): string =>
 
 const as = (message: object): SDKMessage => message as unknown as SDKMessage;
 
+/** Commands Claude Code runs itself, with no reply from Claude. Other text starting with "/" is a prompt. */
+const isLocalCommand = (text: string): boolean => /^\/(model|usage|cost|help)\b/.test(text);
+
 /** Claude Code's words when another process holds the lock on the shared OAuth token. */
 export const REFRESH_ERROR =
   "API Error: Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. " +
@@ -60,7 +63,8 @@ export function createFakeQuery(editFile: string) {
       return inbox.shift();
     };
 
-    const stream = (event: object) => as({ type: "stream_event", event, parent_tool_use_id: null, uuid: "u", session_id: sessionId });
+    const stream = (event: object, extra: object = {}) =>
+      as({ type: "stream_event", event, parent_tool_use_id: null, uuid: "u", session_id: sessionId, ...extra });
     const assistant = (id: string, content: object[]) =>
       as({ type: "assistant", message: { id, content }, parent_tool_use_id: null, uuid: "u", session_id: sessionId });
     const toolResult = (toolUseId: string, content: string, isError: boolean, structured?: object) =>
@@ -89,7 +93,9 @@ export function createFakeQuery(editFile: string) {
       return decision;
     };
 
-    async function* turn(n: number, text: string): AsyncGenerator<SDKMessage, void> {
+    async function* turn(n: number, text: string, uuid?: string): AsyncGenerator<SDKMessage, void> {
+      // The turn's first reply frame names the message it answers, as Claude Code stamps it.
+      const stamp = uuid ? { user_message_uuid: uuid, user_message_uuids: [uuid] } : {};
       // "refresh": Claude Code could not refresh the machine's shared login (another process
       // held the lock). An API-error assistant message and a failed result, and nothing from
       // the API. "refresh-once" fails the first try only; "refresh-always" every try.
@@ -111,7 +117,7 @@ export function createFakeQuery(editFile: string) {
         return;
       }
       const first = `msg_${n}_1`;
-      yield stream({ type: "message_start", message: { id: first } });
+      yield stream({ type: "message_start", message: { id: first } }, stamp);
       // "quiet": thinking with its text omitted, as Claude Code sends it without thinking summaries.
       const thought = text.includes("quiet") ? "" : "Tests first.";
       yield stream({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
@@ -172,7 +178,10 @@ export function createFakeQuery(editFile: string) {
       if (decision.behavior === "deny") yield toolResult(bashId, decision.message, true);
       else yield toolResult(bashId, "ok", false, { stdout: "ok\n", stderr: "", interrupted: false });
 
-      const folded = inbox.splice(0);
+      // Claude Code folds words in at a tool boundary; a slash command waits for the turn to
+      // end and runs on its own, and a "silent" one stands for a message it takes without a word.
+      const folded = inbox.filter((m) => !isLocalCommand(textOf(m)) && !textOf(m).includes("silent"));
+      for (const m of folded) inbox.splice(inbox.indexOf(m), 1);
       if (folded.length > 0) {
         yield as({
           type: "assistant",
@@ -197,7 +206,22 @@ export function createFakeQuery(editFile: string) {
       let n = 0;
       for (let user = await nextInput(); user && !closed; user = await nextInput()) {
         abort = new AbortController();
-        yield* turn(++n, textOf(user));
+        const text = textOf(user);
+        if (isLocalCommand(text)) {
+          // A local command: its output, then a result that names the message. No reply frames.
+          const stamp = user.uuid ? { user_message_uuid: user.uuid, user_message_uuids: [user.uuid] } : {};
+          yield as({ type: "system", subtype: "local_command_output", content: `ran ${text}`, uuid: "u", session_id: sessionId });
+          yield result(n, "success", {
+            result: "",
+            local_command: text.split(" ")[0],
+            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            ...stamp,
+          });
+          continue;
+        }
+        // Taken without a word: no frame will ever name it.
+        if (text.includes("silent")) continue;
+        yield* turn(++n, text, user.uuid);
       }
     }
 

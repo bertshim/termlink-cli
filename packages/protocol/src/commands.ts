@@ -59,10 +59,7 @@ export const SessionSendCommand = command("session.send", SessionRef.extend({ in
 export const SessionInterruptCommand = command("session.interrupt", SessionRef);
 export const SessionCloseCommand = command("session.close", SessionRef);
 /** Changes agent session settings. Changing autoApprove also applies to approvals already waiting. */
-export const SessionConfigureCommand = command(
-  "session.configure",
-  SessionRef.extend({ autoApprove: AutoApprove.optional() }),
-);
+export const SessionConfigureCommand = command("session.configure", SessionRef.extend({ autoApprove: AutoApprove.optional() }));
 export const InputRespondCommand = command(
   "input.respond",
   SessionRef.extend({
@@ -128,6 +125,19 @@ export const UploadAbortCommand = command("upload.abort", UploadRef);
  */
 export const FsListCommand = command("fs.list", z.object({ path: z.string().min(1).max(4096).optional() }));
 
+/**
+ * Largest file fs.read returns. Its base64 in the result, with the envelope, stays well
+ * under what FrameAssembler takes (16 MiB), so the reply always reassembles.
+ */
+export const FS_READ_MAX_BYTES = 10 * 1024 * 1024;
+
+/**
+ * A file's own bytes, for a client previewing a path an agent's reply mentioned (a
+ * screenshot it saved, a report it wrote). One reply of up to FS_READ_MAX_BYTES, not a
+ * general download. The path must be under the host's allowed folders, like fs.list.
+ */
+export const FsReadCommand = command("fs.read", z.object({ path: z.string().min(1).max(4096) }));
+
 export const Command = z.discriminatedUnion("type", [
   HostInfoCommand,
   SessionListCommand,
@@ -147,6 +157,7 @@ export const Command = z.discriminatedUnion("type", [
   UploadEndCommand,
   UploadAbortCommand,
   FsListCommand,
+  FsReadCommand,
 ]);
 export type Command = z.infer<typeof Command>;
 export type CommandType = Command["type"];
@@ -191,6 +202,15 @@ export interface CommandResults {
      *  Hidden ("." prefixed) folders, files, and anything else that is not a
      *  plain directory (a symlink included) are left out. */
     entries: { name: string; path: string }[];
+  };
+  "fs.read": {
+    /** Resolved, symlink-free path actually read. */
+    path: string;
+    /** By extension; "application/octet-stream" when unrecognised. */
+    mimeType: string;
+    size: number;
+    /** Base64 of the file's bytes. */
+    dataBase64: string;
   };
 }
 

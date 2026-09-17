@@ -195,6 +195,8 @@ export class ClientConnection {
         return this.#ok(reqId, command.type, {});
       case "fs.list":
         return this.#ok(reqId, command.type, await this.#manager.listDirectory(command.payload.path));
+      case "fs.read":
+        return this.#ok(reqId, command.type, await this.#manager.readFile(command.payload.path));
     }
   }
 

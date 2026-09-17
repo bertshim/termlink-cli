@@ -118,6 +118,7 @@ command, because what a person approves must be the string that will run.
 | `upload.end` | `{uploadId}` | `{path, name, size}` |
 | `upload.abort` | `{uploadId}` | `{}` |
 | `fs.list` | `{path?}` | `{path, parent, entries}` |
+| `fs.read` | `{path}` | `{path, mimeType, size, dataBase64}`. A file under the allowed folders, up to 10 MiB (`FS_READ_MAX_BYTES`), for a client to preview a file an agent mentioned. `mimeType` comes from the extension; `application/octet-stream` when unknown |
 
 `HostInfo` is `{hostId, name, version, protocol, os, providers[], roots?}`. Each provider is
 `{id, kind, label, available, version, detail, steer?}`; `kind` is `terminal` or `agent`.
@@ -231,6 +232,11 @@ of starting a new one, and the agent reads it at its next step. Only providers w
   `session.updated`.
 - A message that arrives too late to join the turn runs as a turn of its own afterwards. That
   `turn.started` has no `userItemId`.
+- A slash command sent during a turn (a message starting with `/`, such as `/model`) reaches
+  the agent exactly as typed. Claude Code runs it after the turn, without a reply, and it is
+  marked `read` then.
+- A message is never left `queued` behind a later one: the agent takes queued messages in
+  order, so once a later message has been taken, every earlier one is marked `read`.
 - While the turn is being opened (before `turn.started`) the answer is `conflict`.
 
 ## Stop
