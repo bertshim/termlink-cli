@@ -1,24 +1,13 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import type { FileChange, Item, ItemStatus } from "@termlink/protocol";
-import { createTwoFilesPatch } from "diff";
 import { displayCommand } from "../display.js";
+import { displayPath, unifiedDiff } from "../diff.js";
 
-const MAX_DIFF_CHARS = 200_000;
-
-export function displayPath(file: string, cwd: string): string {
-  const relative = path.relative(cwd, file);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return file;
-  return relative.split(path.sep).join("/");
-}
-
-export function unifiedDiff(name: string, before: string, after: string): string {
-  const patch = createTwoFilesPatch(`a/${name}`, `b/${name}`, before, after, undefined, undefined, { context: 3 });
-  // jsdiff opens with an "Index:"/"====" banner; start at the --- line like git does.
-  const start = patch.indexOf("--- ");
-  const diff = start >= 0 ? patch.slice(start) : patch;
-  return diff.length > MAX_DIFF_CHARS ? `${diff.slice(0, MAX_DIFF_CHARS)}\n... diff truncated` : diff;
-}
+// Re-exported for whatever already imports these from here: the diff math itself has
+// nothing Claude-specific in it, and Cursor's own "edit" tool_call needs the same
+// before/after-text-to-unified-diff step, so it now lives at ../diff.js.
+export { displayPath, unifiedDiff };
 
 function readIfExists(file: string): string | null {
   try {

@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { AgentEvent, type EventOf } from "@termlink/protocol";
 import { fileChangesFor } from "../src/providers/claude/mapper.js";
 import { ClaudeProvider } from "../src/providers/claude/provider.js";
+import { MAX_LIMIT_RETRIES } from "../src/providers/claude/session.js";
 import { SessionManager } from "../src/session/manager.js";
 import { createFakeQuery } from "./fixtures/fake-claude.js";
 import { Recorder } from "./support.js";
@@ -161,6 +162,183 @@ test("Stop while a resend is waiting ends the turn and sends nothing more", asyn
   }
 });
 
+async function openLimited(afterResetMs: number) {
+  const { dir, file } = workspace();
+  const fake = createFakeQuery(file);
+  const manager = new SessionManager({ providers: [new ClaudeProvider({ queryFn: fake.queryFn, limitRetryAfterResetMs: afterResetMs })] });
+  const session = await manager.createAgent({ provider: "claude", cwd: dir });
+  const rec = new Recorder();
+  session.attach(rec.push);
+  return { manager, session, rec, log: fake.log };
+}
+
+test("a turn that hits a genuine usage limit is shown as rate_limited, then auto-resent past the reset", async () => {
+  const { manager, session, rec, log } = await openLimited(20);
+  try {
+    await session.send({ text: "limit-once quick" });
+    const failed = (await rec.waitFor(isType("turn.completed"))) as EventOf<"turn.completed">;
+    assert.equal(failed.payload.status, "failed");
+    assert.match(failed.payload.error ?? "", /hit your session limit/);
+    // The wait is session state, not a one-shot event: still readable straight off session.info.
+    assert.equal(session.info.status, "rate_limited");
+    assert.match(session.info.rateLimit?.reason ?? "", /hit your session limit/);
+    assert.ok((session.info.rateLimit?.retryAt ?? 0) >= Date.now());
+
+    const from = rec.items.length;
+    const done = (await rec.waitFor(
+      (e) => e.type === "turn.completed" && e.payload.status === "completed",
+      from,
+    )) as EventOf<"turn.completed">;
+    assert.equal(done.payload.status, "completed");
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+    // One turn's message went to Claude Code twice — the reader sees two turns, the
+    // second one opened by the host itself rather than a person.
+    assert.deepEqual(log.inputs.map((m) => m.message.content), ["limit-once quick", "limit-once quick"]);
+    assert.equal(rec.items.filter(isType("turn.started")).length, 2);
+    for (const event of rec.items) AgentEvent.parse(event);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("a usage limit hit again and again stops auto-retrying at MAX_LIMIT_RETRIES, not forever", async () => {
+  const { manager, session, rec, log } = await openLimited(5);
+  try {
+    await session.send({ text: "limit-always quick" });
+    const start = Date.now();
+    while (rec.items.filter(isType("turn.completed")).length < MAX_LIMIT_RETRIES + 1) {
+      if (Date.now() - start > 5000) throw new Error("timed out waiting for the retry chain to give up");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const completions = rec.items.filter(isType("turn.completed"));
+    assert.equal(completions.length, MAX_LIMIT_RETRIES + 1);
+    assert.ok(completions.every((e) => e.payload.status === "failed"));
+    assert.equal(log.inputs.length, MAX_LIMIT_RETRIES + 1);
+    // Gave up rather than hanging on one last wait forever.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(rec.items.filter(isType("turn.completed")).length, MAX_LIMIT_RETRIES + 1);
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("a manual send while a usage-limit retry is waiting cancels the wait", async () => {
+  const { manager, session, rec, log } = await openLimited(5_000);
+  try {
+    await session.send({ text: "limit-once quick" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+
+    await session.send({ text: "something else quick" });
+    assert.equal(session.info.rateLimit, undefined);
+    const from = rec.items.length;
+    const done = (await rec.waitFor(
+      (e) => e.type === "turn.completed" && e.payload.status === "completed",
+      from,
+    )) as EventOf<"turn.completed">;
+    assert.equal(done.payload.status, "completed");
+    // The scheduled auto-retry never ran: only the person's own two sends reached Claude Code.
+    assert.deepEqual(log.inputs.map((m) => m.message.content), ["limit-once quick", "something else quick"]);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("Stop while a usage-limit retry is waiting cancels it, with no turn to stop", async () => {
+  const { manager, session, rec, log } = await openLimited(30);
+  try {
+    await session.send({ text: "limit-once quick" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+
+    // No turn running — Stop's usual work (interrupt the provider) does not apply;
+    // it cancels the wait instead, the same "stop what the host is about to do on
+    // its own" as it already means for a running turn.
+    await session.interrupt();
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+
+    // Long past when the (cancelled) retry would have fired.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(log.inputs.length, 1);
+    assert.equal(rec.items.filter(isType("turn.completed")).length, 1);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("closing a session while a usage-limit retry is waiting cancels it too, not just Stop", async () => {
+  const { manager, session, rec } = await openLimited(5_000);
+  try {
+    await session.send({ text: "limit-once quick" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+    assert.ok(session.info.rateLimit);
+
+    await manager.close(session.id);
+    // close() shares interrupt()'s own #cancelRateLimitWait() rather than only clearing the
+    // timer: a closed session should not go on reporting a wait it will never act on.
+    assert.equal(session.info.rateLimit, undefined);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("a message steered in right before a turn hits a usage limit is not silently lost", async () => {
+  const { manager, session, rec, log } = await openLimited(30);
+  try {
+    await session.send({ text: "limit-after-tool" });
+    const required = (await rec.waitFor(isType("input.required"))) as EventOf<"input.required">;
+    session.respond(required.payload.request.requestId, "allow");
+
+    // Steered in right after approving the tool — the fixture holds the usage-limit frame
+    // until this reaches it (or 200ms pass), so this lands before the turn fails, unread.
+    await session.send({ text: "also check the lint" });
+
+    const failed = (await rec.waitFor(isType("turn.completed"))) as EventOf<"turn.completed">;
+    assert.equal(failed.payload.status, "failed");
+
+    // The steered text was never folded into the failed turn (it was never read: no Bash-note
+    // frame reached it in time). #completeTurn only drops the queued mark on "interrupted",
+    // not "failed", so it should still be counted, not silently zeroed with no read, no
+    // dropped, and no sign it ever reached anything.
+    assert.equal(session.info.queued, 1);
+
+    // It does reach Claude Code — as its own turn, opened by Claude Code itself the moment it
+    // gets to the queued "too late to fold" message (steer()'s own doc comment), independent
+    // of and ahead of the host's own scheduled retry of the original failed turn. Respond to
+    // whatever approval that turn asks for, same as any other turn, to let it finish.
+    const from = rec.items.length;
+    const again = (await rec.waitFor(isType("input.required"), from)) as EventOf<"input.required">;
+    session.respond(again.payload.request.requestId, "allow");
+    await rec.waitFor((e) => e.type === "turn.completed", from);
+    assert.equal(session.info.queued, 0);
+    // That turn opening on its own, with no send() of its own to cancel the wait, must not
+    // leave a stale rateLimit behind once it is done (the wait it belonged to is moot now).
+    assert.equal(session.info.rateLimit, undefined);
+    assert.ok(
+      log.inputs.some((m) => typeof m.message.content === "string" && m.message.content.includes("also check the lint")),
+      "the steered text must actually reach Claude Code, not just disappear",
+    );
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("Stop with nothing running and no retry pending is still a harmless no-op", async () => {
+  const { manager, session } = await open();
+  try {
+    assert.equal(session.info.status, "idle");
+    await session.interrupt();
+    assert.equal(session.info.status, "idle");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
 test("a denied Bash command is reported as declined", async () => {
   const { manager, session, rec } = await open();
   try {
@@ -241,4 +419,24 @@ test("fileChangesFor diffs Write against the current file and falls back for sta
 test("probe reports Claude as unavailable when the executable is missing", async () => {
   const status = await new ClaudeProvider({ executable: path.join(tmpdir(), "no-such-claude.exe") }).probe();
   assert.equal(status.available, false);
+});
+
+test("session.create's own `chrome` spawns Claude Code with --chrome", async () => {
+  const { dir, file } = workspace();
+  const fake = createFakeQuery(file);
+  const manager = new SessionManager({ providers: [new ClaudeProvider({ queryFn: fake.queryFn })] });
+  await manager.createAgent({ provider: "claude", cwd: dir, chrome: true });
+  // extraArgs is the SDK's own generic CLI-flag passthrough (sdk.d.ts:
+  // "Keys are argument names (without --), values are argument values. Use
+  // `null` for boolean flags.") — this is what actually becomes `--chrome`
+  // on the spawned command line.
+  assert.deepEqual(fake.log.options.at(-1)?.extraArgs, { chrome: null });
+});
+
+test("without it, Claude Code spawns with no extraArgs at all", async () => {
+  const { dir, file } = workspace();
+  const fake = createFakeQuery(file);
+  const manager = new SessionManager({ providers: [new ClaudeProvider({ queryFn: fake.queryFn })] });
+  await manager.createAgent({ provider: "claude", cwd: dir });
+  assert.equal(fake.log.options.at(-1)?.extraArgs, undefined);
 });

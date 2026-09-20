@@ -5,12 +5,15 @@ import type {
   PermissionMode,
   PermissionResult,
   Query,
+  SDKAssistantMessageError,
   SDKMessage,
+  SDKRateLimitInfo,
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { applyDelta, type Decision, type InputRequest, type Item, type Usage } from "@termlink/protocol";
 import { HostError } from "../../errors.js";
+import { isUsageLimitError, resolveRetryAt, RETRY_AFTER_RESET_MS } from "./rate-limit.js";
 import {
   TRACE,
   traceApiStart,
@@ -47,6 +50,10 @@ export const AUTH_RETRY_DELAYS_MS: readonly number[] = [3_000, 8_000];
 const AUTH_REFRESH_RACE = /Failed to refresh OAuth token/i;
 /** How many sent-but-not-yet-taken message uuids are remembered; far more than ever wait at once. */
 const MAX_PUSHED = 500;
+/** Caps the auto-restart chain for one run of usage-limit hits (see #maybeRetryLimit) — belt
+ *  and suspenders against a runaway loop if resolveRetryAt ever mis-scheduled; a real reset
+ *  is hours away, so a session legitimately hitting the cap is not one this saves anyway. */
+export const MAX_LIMIT_RETRIES = 5;
 
 // Content blocks and stream events are read structurally; the SDK types them
 // through the Anthropic API client, and only a few fields matter here.
@@ -74,6 +81,12 @@ export interface ClaudeSessionOptions {
   traceId?: string | undefined;
   cwd: string;
   resume?: string | undefined;
+  /** Spawns Claude Code with `--chrome` (the SDK's own `extraArgs`), so this
+   *  session's tools include browser control over an already-paired Chrome
+   *  extension (~/.claude.json's own `chromeExtension` pairing — this flag
+   *  only turns the integration ON for the process, it does not pair
+   *  anything itself). Claude only; Codex has no such flag. */
+  chrome?: boolean | undefined;
   model?: string | undefined;
   permissionMode?: PermissionMode | undefined;
   executable?: string | undefined;
@@ -81,6 +94,9 @@ export interface ClaudeSessionOptions {
   interruptTimeoutMs?: number | undefined;
   /** Waits before each resend of a turn lost to the login-refresh race; AUTH_RETRY_DELAYS_MS by default. */
   authRetryDelaysMs?: readonly number[] | undefined;
+  /** How long past a usage limit's own reset the auto-retry waits (see rate-limit.ts);
+   *  RETRY_AFTER_RESET_MS by default. Tests shorten it so they need not wait out a real minute. */
+  limitRetryAfterResetMs?: number | undefined;
 }
 
 /**
@@ -149,8 +165,14 @@ export class ClaudeSession implements ProviderSession {
   #retries = 0;
   #retryTimer: NodeJS.Timeout | null = null;
   /** An API error Claude Code reported as an assistant message, held until the turn's result says what came of it. */
-  #heldError: { messageId: string; blocks: Block[] } | null = null;
+  #heldError: { messageId: string; blocks: Block[]; code?: SDKAssistantMessageError } | null = null;
   readonly #authRetryDelays: readonly number[];
+  readonly #limitRetryAfterReset: number;
+  /** The most recent rate_limit_event frame — ambient plan state, not tied to any one
+   *  turn (see #maybeRetryLimit and rate-limit.ts's resolveRetryAt). */
+  #rateLimitInfo: Pick<SDKRateLimitInfo, "status" | "resetsAt"> | null = null;
+  /** How many turns in the current run of usage-limit hits have been auto-resent; see MAX_LIMIT_RETRIES. */
+  #limitRetries = 0;
 
   constructor(sink: EventSink, options: ClaudeSessionOptions) {
     this.#sink = sink;
@@ -159,6 +181,7 @@ export class ClaudeSession implements ProviderSession {
     this.#traceId = options.traceId ?? "";
     this.#interruptTimeoutMs = options.interruptTimeoutMs ?? INTERRUPT_TIMEOUT_MS;
     this.#authRetryDelays = options.authRetryDelaysMs ?? AUTH_RETRY_DELAYS_MS;
+    this.#limitRetryAfterReset = options.limitRetryAfterResetMs ?? RETRY_AFTER_RESET_MS;
     this.#sessionId = options.resume ?? randomUUID();
     this.#hasTranscript = options.resume !== undefined;
     this.#link = this.#connect(options.resume !== undefined);
@@ -188,6 +211,10 @@ export class ClaudeSession implements ProviderSession {
         ...(options.model ? { model: options.model } : {}),
         ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
         ...(options.executable ? { pathToClaudeCodeExecutable: options.executable } : {}),
+        // extraArgs' own values are strings, null for a boolean flag (the
+        // SDK's own doc comment on it) — this becomes plain `--chrome` on
+        // the spawned CLI's command line.
+        ...(options.chrome ? { extraArgs: { chrome: null } } : {}),
       },
     });
     const link: Link = { gen, input, query, ready, markReady };
@@ -426,7 +453,7 @@ export class ClaudeSession implements ProviderSession {
         // until that result, so a turn that is sent again never shows it (see #retryable).
         if (message.error) {
           this.#flushHeldError();
-          this.#heldError = { messageId: message.message.id, blocks: message.message.content as Block[] };
+          this.#heldError = { messageId: message.message.id, blocks: message.message.content as Block[], code: message.error };
           break;
         }
         this.#flushHeldError();
@@ -443,6 +470,9 @@ export class ClaudeSession implements ProviderSession {
         break;
       case "system":
         if (message.subtype === "compact_boundary") this.#sink.emit("provider.event", { name: "claude.compacted", data: {} });
+        break;
+      case "rate_limit_event":
+        this.#rateLimitInfo = message.rate_limit_info;
         break;
     }
   }
@@ -589,6 +619,7 @@ export class ClaudeSession implements ProviderSession {
       this.#retry();
       return;
     }
+    const heldCode = this.#heldError?.code;
     this.#flushHeldError();
     const status = this.#interrupting ? "interrupted" : failed ? "failed" : "completed";
     const error = status !== "failed" ? undefined : errorText;
@@ -601,7 +632,41 @@ export class ClaudeSession implements ProviderSession {
     };
     this.#costSoFar = message.total_cost_usd;
     this.#hasTranscript = true;
+    // Only a genuine usage-limit hit spends the budget #maybeRetryLimit checks below; any
+    // other outcome — success, a Stop, or a failure of some unrelated kind — means whatever
+    // limit incident that budget belonged to is over, so the next one starts with a fresh
+    // MAX_LIMIT_RETRIES rather than carrying a stale count in from one an unrelated failure
+    // in between never got the chance to reset.
+    const limitHit = status === "failed" && error !== undefined && isUsageLimitError(error, heldCode);
+    if (!limitHit) this.#limitRetries = 0;
     this.#completeTurn(status, error, turnUsage);
+    if (limitHit) this.#maybeRetryLimit(error, heldCode);
+  }
+
+  /**
+   * A turn that failed on a genuine usage-limit hit resends itself automatically
+   * once the limit's own reset has had a minute to land (see rate-limit.ts) — the
+   * SDK has no such behaviour on its own; the host supplies it (Bert, 2026-09-18).
+   * Silently skipped if there is nothing to resend (a turn Claude began itself,
+   * #turnText null), this run's retry budget is spent (MAX_LIMIT_RETRIES), the
+   * failure was not actually the usage limit, or neither the SDK's own
+   * rate_limit_event nor the CLI's reset sentence gives a time to wait for.
+   */
+  #maybeRetryLimit(errorText: string, heldCode: SDKAssistantMessageError | undefined): void {
+    if (this.#turnText === null) return;
+    if (this.#limitRetries >= MAX_LIMIT_RETRIES) return;
+    if (!isUsageLimitError(errorText, heldCode)) return;
+    const retryAt = resolveRetryAt({
+      rateLimitInfo: this.#rateLimitInfo,
+      errorText,
+      now: Date.now(),
+      afterResetMs: this.#limitRetryAfterReset,
+    });
+    if (retryAt === null) return;
+    this.#limitRetries++;
+    const delayMs = Math.max(retryAt - Date.now(), 0);
+    if (TRACE) traceLine(`${this.#traceId} usage limit hit: auto-retry #${this.#limitRetries} in ${delayMs}ms`);
+    this.#sink.retryLater(delayMs, { text: this.#turnText }, { reason: errorText, retryAt });
   }
 
   #completeTurn(status: "completed" | "interrupted" | "failed", error?: string, usage?: Usage): void {

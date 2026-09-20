@@ -72,6 +72,8 @@ export class AgentSession {
   #pendingUserItemId: string | null = null;
   /** Set while importing history, so replayed turns do not announce status changes. */
   #quiet = false;
+  /** Armed while status is `rate_limited`: fires the provider's own resend (see retryLater). */
+  #retryTimer: NodeJS.Timeout | null = null;
 
   constructor(info: SessionInfo, onLifecycle: Listener, logCapacity?: number) {
     this.id = info.id;
@@ -96,7 +98,43 @@ export class AgentSession {
       this.#announce("session.updated");
     },
     messageRead: (itemId) => this.#settleQueued(itemId, "read"),
+    retryLater: (delayMs, input, info) => this.#retryLater(delayMs, input, info),
   };
+
+  /**
+   * Schedules an automatic resend of `input` after `delayMs` — see EventSink.retryLater.
+   * Recorded as session state, not just armed silently: status flips to `rate_limited`
+   * and `SessionInfo.rateLimit` carries `reason`/`retryAt` at once, so a client sees the
+   * wait immediately, and still sees it on reconnect hours later. A later call (a fresher
+   * estimate from a second failure) replaces the one already armed rather than stacking.
+   */
+  #retryLater(delayMs: number, input: UserInput, info: { reason: string; retryAt: number }): void {
+    if (this.closed) return;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#info.rateLimit = { ...info };
+    this.#refreshStatus();
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = null;
+      if (this.closed || this.#turnActive) return;
+      void this.send(input).catch(() => {});
+    }, delayMs).unref();
+  }
+
+  /**
+   * Clears a pending auto-retry (status `rate_limited`) if one is armed — shared by
+   * a fresh send() (any send, manual or the retry's own, always ends the wait) and by
+   * Stop's own use of this as "cancel it" when there is no turn running. Returns
+   * whether there was one, so a caller with nothing else to announce can skip it.
+   */
+  #cancelRateLimitWait(): boolean {
+    if (!this.#retryTimer && !this.#info.rateLimit) return false;
+    if (this.#retryTimer) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    this.#info.rateLimit = undefined;
+    return true;
+  }
 
   /** A steered message's next state, said as its item again (item.completed) and in the queued count. */
   #settleQueued(itemId: string, steer: "read" | "dropped"): void {
@@ -194,6 +232,8 @@ export class AgentSession {
     if (this.#interrupting) await this.#interrupting.catch(() => {});
     if (this.closed) throw new HostError("conflict", "session is closed");
     if (this.#turnActive) return this.#steer(input);
+    // A send, manual or the auto-retry's own, always ends any wait that was pending.
+    this.#cancelRateLimitWait();
     // Reserve the turn before any await, so a second send cannot slip in while a restored provider resumes.
     this.#turnActive = true;
     let provider: ProviderSession;
@@ -250,10 +290,19 @@ export class AgentSession {
    * Stops the running turn. The session is `interrupting` until the provider reports
    * turn.completed (or gives up on the process — see the Claude adapter), then idle.
    * Resolves after that; a second Stop meanwhile shares the wait.
+   *
+   * With no turn running, Stop instead cancels a pending usage-limit auto-retry if one
+   * is armed (status `rate_limited`) — the same "stop what the host is about to do on
+   * its own" Stop already means for a running turn, just nothing left to wait out.
+   * A plain no-op otherwise, as before.
    */
   async interrupt(): Promise<void> {
     if (this.closed) throw new HostError("conflict", "session is closed");
-    if (!this.#turnActive || !this.#provider) return;
+    if (!this.#turnActive) {
+      if (this.#cancelRateLimitWait()) this.#refreshStatus();
+      return;
+    }
+    if (!this.#provider) return;
     if (this.#interrupting) return this.#interrupting;
     const run = this.#provider.interrupt();
     this.#interrupting = run.finally(() => {
@@ -274,6 +323,9 @@ export class AgentSession {
 
   async close(reason: string | null): Promise<void> {
     if (this.closed) return;
+    // Shares #cancelRateLimitWait()'s own clear rather than re-doing half of it inline: a
+    // closing session has no more use for either the timer or the rateLimit it was showing.
+    this.#cancelRateLimitWait();
     for (const [requestId, pending] of this.#pending) {
       this.#pending.delete(requestId);
       this.#emit("input.resolved", { requestId, decisionId: null, effect: "cancel", by: "host" });
@@ -383,6 +435,13 @@ export class AgentSession {
       case "turn.started":
         this.#turnActive = true;
         this.#turnId = event.payload.turnId;
+        // Not just #send()'s own explicit cancel: a provider can open a turn on its own
+        // initiative with no send() involved at all (Claude: a message steered in too late
+        // to fold reaches its own tool boundary and runs as a turn of its own — steer()'s
+        // own doc comment). Without this, a wait armed before that turn started is left
+        // pointing at a retryAt already in the past, showing as `rate_limited` again once
+        // the turn ends even though nothing is actually still waiting on it.
+        this.#cancelRateLimitWait();
         this.#refreshStatus();
         break;
       case "turn.completed":
@@ -416,7 +475,9 @@ export class AgentSession {
   #refreshStatus(): void {
     this.#setStatus(
       !this.#turnActive
-        ? "idle"
+        ? this.#info.rateLimit
+          ? "rate_limited"
+          : "idle"
         : this.#interrupting
           ? "interrupting"
           : this.#pending.size > 0

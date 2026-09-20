@@ -42,6 +42,17 @@ export interface EventSink {
   setProviderSessionId(id: string): void;
   /** A message steered into the turn (its item id, as given to steer()) has reached the agent. */
   messageRead(itemId: string): void;
+  /**
+   * Resends `input` as a fresh send() after `delayMs`, as if it had been typed
+   * again — for a provider whose turn failed on something that fixes itself with
+   * time (Claude: a genuine usage-limit hit, a minute past its own reset). The host
+   * session tracks the wait as real session state (status `rate_limited`,
+   * `SessionInfo.rateLimit`), not a one-shot event: it can span hours, so a client
+   * that reconnects partway through must still see it. A no-op at fire time if the
+   * session has closed, or a turn is already running by then — the wait was
+   * superseded by a real send, including this same mechanism's own.
+   */
+  retryLater(delayMs: number, input: UserInput, info: { reason: string; retryAt: number }): void;
 }
 
 export interface StartOptions {
@@ -49,6 +60,10 @@ export interface StartOptions {
   cwd: string;
   /** Provider session or thread to resume instead of starting fresh. */
   resumeProviderSessionId?: string;
+  /** Claude only: spawns with `--chrome` (browser control over an
+   *  already-paired Chrome extension). Ignored by a provider that has no
+   *  such thing — Codex, a terminal. */
+  chrome?: boolean;
 }
 
 export interface ProviderSession {

@@ -22,8 +22,13 @@ export type ProviderId = z.infer<typeof ProviderId>;
 
 export const TERMINAL_PROVIDER = "terminal" as const;
 
-/** `interrupting`: Stop was pressed and the turn has not ended yet (agent sessions). */
-export const SessionStatus = z.enum(["starting", "idle", "running", "waiting_input", "interrupting", "closed"]);
+/**
+ * `interrupting`: Stop was pressed and the turn has not ended yet (agent sessions).
+ * `rate_limited`: a turn failed on the plan's own usage limit and the host is waiting
+ * out `SessionInfo.rateLimit.retryAt` before trying it again on its own (agent
+ * sessions, Claude only for now — see PROTOCOL.md "Rate limits").
+ */
+export const SessionStatus = z.enum(["starting", "idle", "running", "waiting_input", "interrupting", "rate_limited", "closed"]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
 
 /**
@@ -66,6 +71,14 @@ export const SessionInfo = z.object({
   pid: z.number().int().optional(),
   /** Terminal sessions only, once the shell has exited. */
   exitCode: z.number().int().nullable().optional(),
+  /**
+   * Set while status is `rate_limited`: the failed turn's own error text, and when
+   * the host will resend it (a minute past the plan's own reset — PROTOCOL.md "Rate
+   * limits"). Session-level, not an event, precisely because the wait can span
+   * hours: a client that was not even connected when the limit hit still sees it,
+   * on session.list or its next attach, the same as any other status.
+   */
+  rateLimit: z.object({ reason: z.string(), retryAt: z.number() }).optional(),
 });
 export type SessionInfo = z.infer<typeof SessionInfo>;
 
@@ -82,6 +95,12 @@ export const ProviderStatus = z.object({
    * turn instead of waiting for it to end. Absent means they refuse with conflict.
    */
   steer: z.boolean().optional(),
+  /**
+   * A closed session of this provider can be reopened with session.create's own
+   * `resume` (its providerSessionId), landing back in the same transcript instead of
+   * empty. Absent means the provider can't — a client should not offer it.
+   */
+  resumable: z.boolean().optional(),
 });
 export type ProviderStatus = z.infer<typeof ProviderStatus>;
 

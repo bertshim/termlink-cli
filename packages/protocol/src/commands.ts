@@ -35,6 +35,16 @@ export const SessionCreateCommand = command(
     title: z.string().max(200).optional(),
     /** Agent sessions: defaults to the host's setting (off unless the host was started otherwise). */
     autoApprove: AutoApprove.optional(),
+    /**
+     * Agent sessions on a `resumable` provider (host.ready's own ProviderStatus):
+     * a past session's own providerSessionId, to continue that transcript in this
+     * new session instead of starting empty. Refused with `unsupported` on a
+     * provider that isn't resumable.
+     */
+    resume: id.optional(),
+    /** Claude sessions only: spawns with `--chrome` (browser control over an
+     *  already-paired Chrome extension). Ignored on any other provider. */
+    chrome: z.boolean().optional(),
     /** Terminal sessions: initial size. Defaults to 80x24. */
     cols: TerminalSize.shape.cols.optional(),
     rows: TerminalSize.shape.rows.optional(),

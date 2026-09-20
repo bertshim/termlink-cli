@@ -13,6 +13,15 @@ export interface SessionRecord {
   createdAt: number;
   updatedAt: number;
   autoApprove?: AutoApprove;
+  /**
+   * A usage-limit auto-retry that was still armed (status `rate_limited`) when the host
+   * last saved. The wait itself (the in-memory timer, and the exact turn text to resend)
+   * cannot survive a restart — conversation content is never persisted (see this file's
+   * own doc comment) — so restore() cannot re-arm it. Kept here only so restore() can say
+   * plainly that a session's own auto-retry did not make it, instead of the wait silently
+   * vanishing with no trace anywhere.
+   */
+  rateLimit?: { reason: string; retryAt: number };
 }
 
 export function defaultStatePath(): string {

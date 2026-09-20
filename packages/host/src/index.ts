@@ -20,9 +20,14 @@ export type * from "./providers/types.js";
 export { ShellProvider, type ShellProviderOptions } from "./providers/terminal.js";
 export { CodexProvider, type CodexProviderOptions } from "./providers/codex/provider.js";
 export { resolveCodexCommand, type CodexCommand } from "./providers/codex/command.js";
+export { CursorProvider, type CursorProviderOptions } from "./providers/cursor/provider.js";
+export { resolveCursorCommand, type CursorCommand } from "./providers/cursor/command.js";
+export { CopilotProvider, type CopilotProviderOptions } from "./providers/copilot/provider.js";
+export { resolveCopilotCommand, type CopilotCommand } from "./providers/copilot/command.js";
 export {
   ClaudeProvider,
   CLAUDE_PERMISSION_MODES,
+  apiKeyAuth,
   bundledClaudeExecutable,
   type ClaudePermissionMode,
   type ClaudeProviderOptions,

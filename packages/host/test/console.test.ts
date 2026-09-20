@@ -35,6 +35,11 @@ test("the session summary counts each kind and what is busy", () => {
   assert.equal(sessionSummary(busy, labels), "3 sessions: 2 Claude, 1 Terminal; 1 working, 1 waiting for you");
 });
 
+test("the session summary counts a session waiting out a usage-limit auto-retry", () => {
+  const waiting = [session({ status: "rate_limited" })];
+  assert.equal(sessionSummary(waiting, labels), "1 session: 1 Claude; 1 rate-limited");
+});
+
 test("the status line moves its dots, says how to stop, and carries no address", () => {
   const frames = [0, 1, 2, 3].map((f) => statusText(idle, f, labels));
   assert.equal(new Set(frames).size, 4);

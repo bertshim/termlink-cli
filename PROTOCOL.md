@@ -76,7 +76,9 @@ after it names it in `userItemId`.
 `provider.event` names in use: `claude.compacted` (Claude Code compacted the conversation),
 `claude.restarted` (a Stop replaced an unresponsive Claude Code process on the same
 conversation), `claude.retry` (the host is sending a turn's message again because Claude Code
-could not refresh the machine's shared login; `data`: `reason`, `attempt`, `delayMs`).
+could not refresh the machine's shared login; `data`: `reason`, `attempt`, `delayMs`),
+`cursor.unsupported_request` and `copilot.unsupported_request` (the provider's ACP server sent
+a request kind this host doesn't handle yet; `data`: `method`).
 
 ## Items
 
@@ -204,9 +206,10 @@ Each agent session has a mode for answering approvals by itself (`SessionInfo.au
 
 ## Session status
 
-`starting`, then `idle`, `running`, `waiting_input` and `interrupting`, and at any time `closed`.
-The host computes it: `idle` with no turn, `interrupting` from a Stop until the turn ends,
-`waiting_input` while an approval waits, `running` otherwise.
+`starting`, then `idle`, `running`, `waiting_input`, `interrupting` and `rate_limited`, and at
+any time `closed`. The host computes it: `idle` with no turn, `interrupting` from a Stop until
+the turn ends, `waiting_input` while an approval waits, `rate_limited` while an auto-retry from a
+usage-limit hit is armed (see "Rate limits" below), `running` otherwise.
 
 - `session.send` is handled in order per session. The next message looks at "is a turn
   running?" only after the previous one has opened its turn, so messages sent in quick
@@ -217,6 +220,34 @@ The host computes it: `idle` with no turn, `interrupting` from a Stop until the 
   the message before sending uses it to match the host's copy with its own. It must be unique
   within the client.
 - `session.send` and `session.interrupt` on a closed session are `conflict`.
+
+## Rate limits
+
+The Claude Agent SDK's `query()` has no built-in behaviour for a plan's usage limit: a turn that
+hits one just ends, failed, like any other error — the interactive CLI's own auto-restart-at-reset
+is not something `query()` does on its own. The host supplies it instead (Claude only, for now).
+
+- A failed turn whose error is a genuine usage-limit hit — Claude Code's own API error code
+  `rate_limit`, or its result text starting with one of its own "genuinely reached" prefixes —
+  is resent automatically, once, past the limit's own reset.
+- The reset time comes from the SDK's own `rate_limit_event` frame when one has arrived
+  (`status: "rejected"`, `resetsAt`); failing that, the host parses it out of the CLI's own
+  sentence ("... resets 7:30pm (Asia/Seoul)"). If neither gives a usable time, the turn just
+  stays `failed`, as it always did.
+- The resend happens a minute past that reset, not exactly at it — long enough that the reset has
+  genuinely landed server-side.
+- The wait is real session state, not a one-shot event: status is `rate_limited` and
+  `SessionInfo.rateLimit` carries `{ reason, retryAt }` for as long as it is armed, so a client
+  that was not even connected when the limit hit still sees it, on `session.list` or its next
+  attach — it can span hours.
+- Any `session.send` — the host's own auto-retry, or a person typing over it — cancels the wait
+  at once and proceeds as a normal send; the two are not distinguished on the wire.
+- A run of repeated usage-limit hits stops auto-retrying after a few tries rather than forever,
+  belt and suspenders against a wait that was scheduled wrong.
+- The wait does not survive a host restart: conversation content is never persisted, so there is
+  no stored text left to resend. A session restored with one still armed just comes back without
+  it — no client was necessarily there to be told either — though the host's own startup line
+  counts how many; sending to that session again works as a normal send.
 
 ## Messages during a turn
 

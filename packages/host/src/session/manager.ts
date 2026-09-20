@@ -18,6 +18,19 @@ export interface CreateSessionOptions {
   title?: string | undefined;
   /** Agent sessions. */
   autoApprove?: AutoApprove | undefined;
+  /**
+   * Agent sessions on a `resumable` provider: a past session's own
+   * providerSessionId (SessionInfo.providerSessionId), to continue its
+   * transcript in a brand new session rather than starting empty — the same
+   * mechanism restore() already uses to bring a session back after a host
+   * restart, now reachable from a client that closed a session on purpose
+   * and wants it back (session.create's own `resume` field). Rejected with
+   * `unsupported` when the provider isn't resumable.
+   */
+  resumeProviderSessionId?: string | undefined;
+  /** Claude only: spawns with `--chrome` (StartOptions' own doc comment).
+   *  Ignored by any other provider. */
+  chrome?: boolean | undefined;
   /** Terminal sessions. */
   cols?: number | undefined;
   rows?: number | undefined;
@@ -52,6 +65,7 @@ export class SessionManager {
   readonly #flow: FlowControlOptions;
   #persistTimer: NodeJS.Timeout | null = null;
   #stopping = false;
+  #lastRestoreRateLimitLost = 0;
 
   constructor(options: SessionManagerOptions) {
     for (const provider of options.providers) this.#providers.set(provider.id, provider);
@@ -67,6 +81,12 @@ export class SessionManager {
     return this.#roots ? [...this.#roots] : undefined;
   }
 
+  /** How many of the sessions restore() just brought back had a usage-limit auto-retry
+   *  armed that could not come back with them (see restore()'s own note on why). */
+  get lastRestoreRateLimitLost(): number {
+    return this.#lastRestoreRateLimitLost;
+  }
+
   onHostEvent(listener: Listener): () => void {
     this.#hostListeners.add(listener);
     return () => this.#hostListeners.delete(listener);
@@ -80,6 +100,9 @@ export class SessionManager {
           kind: provider.kind,
           label: provider.label,
           ...(provider.kind === "agent" && provider.steer ? { steer: true } : {}),
+          // A client offers "resume this closed session" only for a provider
+          // that can actually do it (session.create's own `resume` field).
+          ...(provider.kind === "agent" && provider.resumable ? { resumable: true } : {}),
         };
         try {
           return { ...identity, ...(await provider.probe()) };
@@ -143,13 +166,20 @@ export class SessionManager {
   }
 
   async #createAgent(provider: ProviderAdapter, cwd: string, options: CreateSessionOptions): Promise<AgentSession> {
+    const resumeId = options.resumeProviderSessionId;
+    if (resumeId && !provider.resumable) {
+      throw new HostError("unsupported", `${provider.id} sessions can't be resumed`);
+    }
     const now = Date.now();
     const session = new AgentSession(
       {
         id: newId("ag"),
         kind: "agent",
         provider: provider.id,
-        providerSessionId: null,
+        // Known immediately for a resume, same as restore() below — the
+        // provider's own start() will report it again once the process is
+        // actually up, but SessionInfo carries it from the first announce.
+        providerSessionId: resumeId ?? null,
         cwd,
         title: options.title ?? null,
         status: "starting",
@@ -163,8 +193,26 @@ export class SessionManager {
     );
     this.#sessions.set(session.id, session);
     session.announce();
+    if (resumeId && provider.history) {
+      // History is a convenience; a session without it can still be resumed
+      // (restore()'s own comment) — the CLI's own transcript still loads
+      // once start() actually spawns it, this just has it on screen already
+      // rather than waiting on that.
+      const turns = await provider.history(resumeId, cwd).catch(() => []);
+      session.importHistory(turns);
+    }
     try {
-      session.bind(await provider.start({ sessionId: session.id, cwd }, session.sink));
+      session.bind(
+        await provider.start(
+          {
+            sessionId: session.id,
+            cwd,
+            ...(resumeId ? { resumeProviderSessionId: resumeId } : {}),
+            ...(options.chrome ? { chrome: true } : {}),
+          },
+          session.sink,
+        ),
+      );
     } catch (err) {
       await this.close(session.id, `failed to start: ${errorMessage(err)}`);
       throw new HostError("internal", `failed to start ${provider.id}: ${errorMessage(err)}`);
@@ -211,6 +259,7 @@ export class SessionManager {
    * Terminal sessions are never remembered: their shell died with the previous host.
    */
   async restore(): Promise<number> {
+    this.#lastRestoreRateLimitLost = 0;
     if (!this.#store) return 0;
     let restored = 0;
     for (const record of await this.#store.load()) {
@@ -246,6 +295,11 @@ export class SessionManager {
       }
       this.#sessions.set(session.id, session);
       session.announce();
+      // The wait itself could not come back (store.ts's own note on why) — no client is
+      // necessarily attached yet to hear a provider.event about it (and provider.event
+      // is not durable, so one emitted here with nobody listening would just be lost).
+      // Counted instead, for whoever starts the host to see in its own startup line.
+      if (record.rateLimit) this.#lastRestoreRateLimitLost++;
       session.bindLazy(() =>
         provider.start({ sessionId: session.id, cwd, resumeProviderSessionId: record.providerSessionId }, session.sink),
       );
@@ -305,6 +359,7 @@ export class SessionManager {
         createdAt: info.createdAt,
         updatedAt: info.updatedAt,
         ...(info.autoApprove ? { autoApprove: info.autoApprove } : {}),
+        ...(info.rateLimit ? { rateLimit: info.rateLimit } : {}),
       });
     }
     await this.#store.save(records);

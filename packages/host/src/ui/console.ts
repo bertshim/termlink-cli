@@ -53,7 +53,12 @@ export function sessionSummary(sessions: readonly SessionInfo[], labels: Labels)
   const kinds = [...byLabel].map(([label, n]) => `${n} ${label}`).join(", ");
   const working = sessions.filter((s) => s.kind === "agent" && (s.status === "running" || s.status === "interrupting")).length;
   const waiting = sessions.filter((s) => s.status === "waiting_input").length;
-  const activity = [working > 0 ? `${working} working` : "", waiting > 0 ? `${waiting} waiting for you` : ""]
+  const rateLimited = sessions.filter((s) => s.status === "rate_limited").length;
+  const activity = [
+    working > 0 ? `${working} working` : "",
+    waiting > 0 ? `${waiting} waiting for you` : "",
+    rateLimited > 0 ? `${rateLimited} rate-limited` : "",
+  ]
     .filter(Boolean)
     .join(", ");
   return `${sessions.length} session${sessions.length === 1 ? "" : "s"}: ${kinds}${activity ? `; ${activity}` : ""}`;

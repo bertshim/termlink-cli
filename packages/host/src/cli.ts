@@ -8,6 +8,8 @@ import { AutoApprove, PROTOCOL_VERSION, type HostInfo } from "@termlink/protocol
 import { listDevices, loginAndEnroll, revokeDevices } from "./auth/login.js";
 import { CLAUDE_PERMISSION_MODES, ClaudeProvider } from "./providers/claude/provider.js";
 import { CodexProvider } from "./providers/codex/provider.js";
+import { CopilotProvider } from "./providers/copilot/provider.js";
+import { CursorProvider } from "./providers/cursor/provider.js";
 import { ShellProvider } from "./providers/terminal.js";
 import type { HostProvider } from "./providers/types.js";
 import { RelayHttpError } from "./relay/api.js";
@@ -23,7 +25,8 @@ import { VERSION } from "./version.js";
 
 const APPROVAL_POLICIES = ["untrusted", "on-request", "never"] as const;
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-const DEFAULT_PROVIDERS = "terminal,claude,codex";
+const CURSOR_MODES = ["agent", "plan", "ask"] as const;
+const DEFAULT_PROVIDERS = "claude,codex,cursor,copilot,terminal";
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
 
 const USAGE = `Usage: termlink <command> [options]
@@ -56,6 +59,8 @@ Options for start:
   --claude-model <model>          model for new Claude sessions (default: Claude Code settings)
   --codex-approval <mode>         ${APPROVAL_POLICIES.join(" | ")} (default: ~/.codex/config.toml)
   --codex-sandbox <mode>          ${SANDBOX_MODES.join(" | ")} (default: ~/.codex/config.toml)
+  --cursor-model <model>          a session/new modelId (e.g. claude-sonnet-5[thinking=true]) for new Cursor sessions (default: the account's own default)
+  --cursor-mode <mode>            ${CURSOR_MODES.join(" | ")} for new Cursor sessions (default: the account's own default, usually agent)
 
 Options for every command:
   --server <url>                  master relay (default: $TERMLINK_SERVER or ${DEFAULT_SERVER})
@@ -97,6 +102,8 @@ async function main(): Promise<void> {
       "claude-model": { type: "string" },
       "codex-approval": { type: "string" },
       "codex-sandbox": { type: "string" },
+      "cursor-model": { type: "string" },
+      "cursor-mode": { type: "string" },
       all: { type: "boolean", default: false },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
@@ -150,6 +157,8 @@ type Values = {
   "claude-model"?: string | undefined;
   "codex-approval"?: string | undefined;
   "codex-sandbox"?: string | undefined;
+  "cursor-model"?: string | undefined;
+  "cursor-mode"?: string | undefined;
 };
 
 async function start(values: Values, server: string, credentialPath: string): Promise<void> {
@@ -160,6 +169,7 @@ async function start(values: Values, server: string, credentialPath: string): Pr
   const permissionMode = oneOf(values["claude-permission-mode"], CLAUDE_PERMISSION_MODES, "--claude-permission-mode");
   const approvalPolicy = oneOf(values["codex-approval"], APPROVAL_POLICIES, "--codex-approval");
   const sandbox = oneOf(values["codex-sandbox"], SANDBOX_MODES, "--codex-sandbox");
+  const cursorMode = oneOf(values["cursor-mode"], CURSOR_MODES, "--cursor-mode");
   const scrollback = integer(values.scrollback, "--scrollback", 0, 100_000);
   // Remote clients pick the folder, so joining the relay narrows it to where the host was started.
   const allowRoots = values["allow-root"] ?? [];
@@ -170,6 +180,8 @@ async function start(values: Values, server: string, credentialPath: string): Pr
     if (name === "terminal") providers.push(new ShellProvider({ shell: values.shell, scrollback }));
     else if (name === "codex") providers.push(new CodexProvider({ approvalPolicy, sandbox }));
     else if (name === "claude") providers.push(new ClaudeProvider({ permissionMode, model: values["claude-model"] }));
+    else if (name === "cursor") providers.push(new CursorProvider({ model: values["cursor-model"], mode: cursorMode }));
+    else if (name === "copilot") providers.push(new CopilotProvider());
     else throw new Error(`unknown provider: ${name}`);
   }
   const labels = Object.fromEntries(providers.map((p) => [p.id, p.label]));
@@ -217,6 +229,10 @@ async function start(values: Values, server: string, credentialPath: string): Pr
   if (manager.roots) ui.print(`  Sessions open in: ${manager.roots.join(", ")}`);
   if (autoApprove && autoApprove !== "off") ui.print(`  New agent sessions auto-approve: ${autoApprove}`);
   if (restored > 0) ui.print(`  Restored ${restored} agent session${restored === 1 ? "" : "s"} from the last run`);
+  if (manager.lastRestoreRateLimitLost > 0) {
+    const n = manager.lastRestoreRateLimitLost;
+    ui.print(`  ${n} of them ${n === 1 ? "was" : "were"} waiting out a usage limit; that wait did not survive the restart, send to ${n === 1 ? "it" : "them"} again`);
+  }
   ui.print();
   ui.print("Keep this window open while you use TermLink: closing it ends the terminal sessions running here.");
   ui.print("Stop with Ctrl+C. Agent sessions are saved and come back when the host starts again.");

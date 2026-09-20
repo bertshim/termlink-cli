@@ -4,6 +4,14 @@
 //   "ask"       AskUserQuestion
 //   "fail"      an error result
 //   "stubborn"  ignores the interrupt: after the Bash ask is denied it hangs until close()
+//   "limit"     a genuine usage-limit hit: a rate_limit_event frame (already-passed resetsAt,
+//               so the host's own afterResetMs option is the only wait left to control in a
+//               test) then a failed result with the CLI's own reset sentence. "always"/once
+//               split same as "refresh" below. Fails before any tool boundary, so nothing
+//               steered in has a chance to fold first.
+//   "limit-after-tool"  the same limit hit, but after the Bash tool ran — so a message
+//               steered in during the tool call is still unread (unfolded) when the turn
+//               fails, the same as a message that comes "too late to fold" (see below).
 // A message pushed while a turn plays is folded into it after the Bash result (the next
 // tool boundary), answered "Noted: <text>", as Claude Code folds a queued message. The
 // "ask" turn has no such boundary, so a message sent during it runs as the next turn.
@@ -44,6 +52,7 @@ export function createFakeQuery(editFile: string) {
     let closed = false;
     let unhang: (() => void) | null = null;
     let refreshFailures = 0;
+    let limitFailures = 0;
 
     // The prompt stream is read all the time, as the CLI reads stdin, so a message
     // pushed mid-turn is waiting here for the turn to fold it in or run it next.
@@ -116,6 +125,23 @@ export function createFakeQuery(editFile: string) {
         });
         return;
       }
+      if (text.includes("limit") && !text.includes("limit-after-tool") && (text.includes("always") || limitFailures++ === 0)) {
+        yield as({
+          type: "rate_limit_event",
+          // Already past: the fake leaves the whole wait to the host's own afterResetMs
+          // option, which a test shortens the same way it shortens authRetryDelaysMs.
+          rate_limit_info: { status: "rejected", resetsAt: Date.now(), rateLimitType: "five_hour" },
+          uuid: "u",
+          session_id: sessionId,
+        });
+        yield result(n, "success", {
+          is_error: true,
+          result: "You've hit your session limit · resets 7:30pm (Asia/Seoul)",
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          total_cost_usd: 0,
+        });
+        return;
+      }
       const first = `msg_${n}_1`;
       yield stream({ type: "message_start", message: { id: first } }, stamp);
       // "quiet": thinking with its text omitted, as Claude Code sends it without thinking summaries.
@@ -177,6 +203,32 @@ export function createFakeQuery(editFile: string) {
       }
       if (decision.behavior === "deny") yield toolResult(bashId, decision.message, true);
       else yield toolResult(bashId, "ok", false, { stdout: "ok\n", stderr: "", interrupted: false });
+
+      // "limit-after-tool": the tool ran, but the very next model call (the one that would
+      // normally fold in anything steered meanwhile) is the one that hits the usage limit —
+      // unlike plain "limit", which fails before ever reaching a tool boundary. Whatever is
+      // steered by this point is still unread (never folded in), same as a real "too late to
+      // fold" message.
+      if (text.includes("limit-after-tool") && (text.includes("always") || limitFailures++ === 0)) {
+        // A steer() called right after approving the tool needs a moment to actually reach
+        // inbox before this turn ends — polled instead of racing microtask scheduling, and
+        // capped so a run with nothing steered still fails promptly.
+        const waitStart = Date.now();
+        while (inbox.length === 0 && Date.now() - waitStart < 200) await new Promise((resolve) => setTimeout(resolve, 2));
+        yield as({
+          type: "rate_limit_event",
+          rate_limit_info: { status: "rejected", resetsAt: Date.now(), rateLimitType: "five_hour" },
+          uuid: "u",
+          session_id: sessionId,
+        });
+        yield result(n, "success", {
+          is_error: true,
+          result: "You've hit your session limit · resets 7:30pm (Asia/Seoul)",
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          total_cost_usd: 0,
+        });
+        return;
+      }
 
       // Claude Code folds words in at a tool boundary; a slash command waits for the turn to
       // end and runs on its own, and a "silent" one stands for a message it takes without a word.

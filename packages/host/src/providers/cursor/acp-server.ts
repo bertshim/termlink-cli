@@ -1,0 +1,115 @@
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { CursorCommand } from "./command.js";
+import type { AuthenticateParams, InitializeParams, InitializeResponse, RequestId } from "./protocol.js";
+import { JsonRpcPeer, RpcError } from "../rpc.js";
+
+/** Receives the notifications and server requests that belong to one ACP session. */
+export interface AcpSessionHandler {
+  notification(method: string, params: unknown): void;
+  request(method: string, params: unknown, id: RequestId): Promise<unknown>;
+  /** The cursor-agent process went away. */
+  closed(reason: Error): void;
+}
+
+/** ACP puts the auth method to use in initialize's own response; this is the only one
+ *  cursor-agent has ever advertised, and it maps to whatever `cursor-agent login` stored. */
+const AUTH_METHOD = "cursor_login";
+
+/**
+ * One long-lived `cursor-agent acp` process shared by every Cursor session on this host,
+ * the same way CodexAppServer shares one `codex app-server`. Routes session/update
+ * notifications and session/request_permission (and Cursor's own cursor/* requests) to
+ * sessions by the sessionId ACP itself puts in `params`.
+ */
+export class CursorAcpServer {
+  readonly peer: JsonRpcPeer;
+  readonly #child: ChildProcessWithoutNullStreams;
+  readonly #sessions = new Map<string, AcpSessionHandler>();
+  readonly #stderrTail: string[] = [];
+  #onExit: (reason: Error) => void = () => {};
+
+  private constructor(child: ChildProcessWithoutNullStreams) {
+    this.#child = child;
+    this.peer = new JsonRpcPeer(child.stdout, child.stdin);
+    this.peer.onNotification = (method, params) => this.#sessionFor(params)?.notification(method, params);
+    this.peer.onRequest = async (method, params, id) => {
+      const session = this.#sessionFor(params);
+      if (!session) throw new RpcError(-32601, `${method} has no session on this client`);
+      return session.request(method, params, id);
+    };
+    this.peer.onClose = (reason) => {
+      for (const session of this.#sessions.values()) session.closed(reason);
+      this.#sessions.clear();
+      this.#onExit(reason);
+    };
+
+    child.stdin.on("error", () => {});
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      this.#stderrTail.push(...chunk.split(/\r?\n/).filter(Boolean));
+      this.#stderrTail.splice(0, Math.max(0, this.#stderrTail.length - 20));
+    });
+    child.on("error", (err) => this.peer.close(err));
+    child.on("exit", (code, signal) => {
+      const tail = this.#stderrTail.at(-1);
+      this.peer.close(new Error(`cursor-agent acp exited (${signal ?? code})${tail ? `: ${tail}` : ""}`));
+    });
+  }
+
+  static async start(command: CursorCommand, onExit: (reason: Error) => void): Promise<CursorAcpServer> {
+    const child = spawn(command.file, [...command.args, "acp"], {
+      stdio: "pipe",
+      windowsHide: true,
+      shell: command.shell,
+    });
+    const server = new CursorAcpServer(child as ChildProcessWithoutNullStreams);
+    server.#onExit = onExit;
+    try {
+      const params: InitializeParams = { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } };
+      const init = await server.peer.request<InitializeResponse>("initialize", params);
+      if (!init.authMethods.some((m) => m.id === AUTH_METHOD)) {
+        throw new Error(`cursor-agent acp offered no "${AUTH_METHOD}" auth method (has it been updated?)`);
+      }
+      await server.peer.request("authenticate", { methodId: AUTH_METHOD } satisfies AuthenticateParams);
+    } catch (err) {
+      server.close();
+      throw err;
+    }
+    return server;
+  }
+
+  register(sessionId: string, handler: AcpSessionHandler): void {
+    this.#sessions.set(sessionId, handler);
+  }
+
+  /** True while a live session (or history()'s own throwaway collector) already owns this
+   *  id's notifications — register() would silently steal them out from under it otherwise. */
+  has(sessionId: string): boolean {
+    return this.#sessions.has(sessionId);
+  }
+
+  unregister(sessionId: string): void {
+    this.#sessions.delete(sessionId);
+  }
+
+  close(): void {
+    this.#onExit = () => {};
+    this.peer.close(new Error("cursor-agent acp closed by host"));
+    this.#child.stdin.end();
+    if (this.#child.exitCode !== null) return;
+    const pid = this.#child.pid;
+    // The installed `cursor-agent` on PATH is a launcher (cmd -> powershell -> node on
+    // Windows; command.ts's own comment), spawned with a shell to run it at all. Killing
+    // just that top process leaves the real node.exe running: the whole tree has to go.
+    if (process.platform === "win32" && pid !== undefined) {
+      execFile("taskkill", ["/pid", String(pid), "/t", "/f"], () => {});
+    } else {
+      this.#child.kill();
+    }
+  }
+
+  #sessionFor(params: unknown): AcpSessionHandler | undefined {
+    if (typeof params !== "object" || params === null || !("sessionId" in params)) return undefined;
+    return typeof params.sessionId === "string" ? this.#sessions.get(params.sessionId) : undefined;
+  }
+}

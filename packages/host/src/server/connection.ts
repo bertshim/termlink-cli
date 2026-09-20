@@ -123,7 +123,10 @@ export class ClientConnection {
       case "session.list":
         return this.#ok(reqId, command.type, { sessions: this.#manager.list() });
       case "session.create": {
-        const session = await this.#manager.create(command.payload);
+        // Wire name is short (`resume`); the manager's own field spells out what
+        // it actually is (resumeProviderSessionId), matching StartOptions below it.
+        const { resume, ...payload } = command.payload;
+        const session = await this.#manager.create({ ...payload, resumeProviderSessionId: resume });
         if (session instanceof TerminalSession) {
           const attachment = this.#subscribeTerminal(session, command.payload.clientId);
           this.#ok(reqId, command.type, { session: session.info });

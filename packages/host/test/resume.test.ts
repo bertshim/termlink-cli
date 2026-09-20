@@ -6,9 +6,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AgentEvent, EventOf } from "@termlink/protocol";
+import { ProviderStatus } from "@termlink/protocol";
 import { claudeHistory, type TranscriptMessage } from "../src/providers/claude/history.js";
 import { ClaudeProvider } from "../src/providers/claude/provider.js";
 import { CodexProvider } from "../src/providers/codex/provider.js";
+import { HostError } from "../src/errors.js";
 import { FakeProvider } from "./fixtures/fake-provider.js";
 import { SessionManager } from "../src/session/manager.js";
 import { SessionStore } from "../src/session/store.js";
@@ -135,6 +137,37 @@ test("a Claude session comes back with its transcript and resumes by session id"
   }
 });
 
+test("a session restored with a usage-limit wait armed comes back without it, counted for the startup line", async () => {
+  const { dir, file, store } = workspace();
+  const fake = createFakeQuery(file);
+  const provider = () => new ClaudeProvider({ queryFn: fake.queryFn, historyFn: async () => [] });
+
+  const first = new SessionManager({ providers: [provider()], store });
+  const original = await first.createAgent({ provider: "claude", cwd: dir });
+  const rec = new Recorder();
+  original.attach(rec.push);
+  await runTurn(original, rec, "run the tests", "allow");
+  await first.shutdown();
+
+  // Stand in for a host that saved while a usage-limit auto-retry was still armed: add
+  // rateLimit to the persisted record by hand, the way #persistNow() would from
+  // SessionInfo.rateLimit if the session were still rate_limited at shutdown.
+  const saved = await store.load();
+  await store.save(saved.map((r) => ({ ...r, rateLimit: { reason: "usage limit reached", retryAt: Date.now() + 3_600_000 } })));
+
+  const second = new SessionManager({ providers: [provider()], store });
+  try {
+    assert.equal(await second.restore(), 1);
+    assert.equal(second.lastRestoreRateLimitLost, 1);
+    // A normal session, not stuck reporting rate_limited with no timer actually behind it.
+    const restored = second.agent(original.id);
+    assert.equal(restored.info.status, "idle");
+    assert.equal(restored.info.rateLimit, undefined);
+  } finally {
+    await second.shutdown();
+  }
+});
+
 test("opening a restored Claude session resumes it before the first message", async () => {
   const { dir, file, store } = workspace();
   const fake = createFakeQuery(file);
@@ -166,6 +199,84 @@ test("opening a restored Claude session resumes it before the first message", as
     assert.equal(fake.log.options.length, started + 1);
   } finally {
     await second.shutdown();
+  }
+});
+
+test("the host says which agent providers can be resumed by a client", async () => {
+  const manager = new SessionManager({ providers: [new ClaudeProvider(), new CodexProvider({ command: null })] });
+  try {
+    const [claude, codex] = await manager.providerStatuses();
+    assert.equal(ProviderStatus.parse(claude).resumable, true);
+    assert.equal(ProviderStatus.parse(codex).resumable, true);
+  } finally {
+    await manager.shutdown();
+  }
+  const fake = new SessionManager({ providers: [new FakeProvider({ stepDelayMs: 0 })] });
+  try {
+    const [status] = await fake.providerStatuses();
+    assert.equal(status?.resumable, undefined);
+  } finally {
+    await fake.shutdown();
+  }
+});
+
+test("session.create's own resume reopens a CLOSED session with its transcript, no restart needed", async () => {
+  const { dir, file, store } = workspace();
+  const fake = createFakeQuery(file);
+  const transcript: TranscriptMessage[] = [
+    { type: "user", uuid: "u1", message: { role: "user", content: "run the tests" }, parent_tool_use_id: null },
+    { type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "Done" }] }, parent_tool_use_id: null },
+  ];
+  const provider = () => new ClaudeProvider({ queryFn: fake.queryFn, historyFn: async () => transcript });
+
+  const manager = new SessionManager({ providers: [provider()], store });
+  try {
+    const original = await manager.createAgent({ provider: "claude", cwd: dir });
+    const rec = new Recorder();
+    original.attach(rec.push);
+    await runTurn(original, rec, "run the tests", "allow");
+    const claudeSessionId = original.info.providerSessionId;
+    assert.ok(claudeSessionId);
+
+    // Closed on purpose — not a restart — and forgotten by the store the
+    // same way "closing a session forgets it" below already checks.
+    await manager.close(original.id);
+
+    const reopened = await manager.createAgent({
+      provider: "claude",
+      cwd: dir,
+      resumeProviderSessionId: claudeSessionId,
+    });
+    // The transcript is on screen from the very first announce, same as a
+    // session restore()d after a host restart — no round trip to the CLI
+    // needed to see it.
+    assert.equal(reopened.info.providerSessionId, claudeSessionId);
+    assert.notEqual(reopened.id, original.id);
+    const again = new Recorder();
+    const items = reopened
+      .attach(again.push, 0)
+      .replay.filter((e): e is EventOf<"item.completed"> => e.type === "item.completed")
+      .map((e) => e.payload.item);
+    assert.deepEqual(items.map((i) => i.kind), ["message", "message"]);
+
+    // And it is the SAME underlying conversation as far as Claude is
+    // concerned: the next turn resumes it by session id.
+    await runTurn(reopened, again, "and again", "allow");
+    assert.equal(fake.log.options.at(-1)?.resume, claudeSessionId);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("resume is refused for a provider that can't — the client's own guess is never trusted blindly", async () => {
+  const manager = new SessionManager({ providers: [new FakeProvider({ stepDelayMs: 0 })] });
+  try {
+    await assert.rejects(
+      manager.createAgent({ provider: "fake", cwd: tmpdir(), resumeProviderSessionId: "whatever" }),
+      (err: unknown) => err instanceof HostError && err.code === "unsupported",
+    );
+  } finally {
+    await manager.shutdown();
   }
 });
 

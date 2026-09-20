@@ -28,8 +28,12 @@ export interface ClaudeProviderOptions {
   interruptTimeoutMs?: number;
   /** Waits before each resend of a turn that failed on the login-refresh race (see ClaudeSession); tests shorten them. */
   authRetryDelaysMs?: readonly number[];
+  /** How long past a usage limit's own reset the auto-retry waits (see ClaudeSession, rate-limit.ts); tests shorten it. */
+  limitRetryAfterResetMs?: number;
   /** Replaces the SDK's getSessionMessages() in tests. */
   historyFn?: HistoryFn;
+  /** Read for apiKeyAuth() in probe(); tests inject one instead of the host's own process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 // A good status is kept a minute. A bad one is re-checked soon: the first run of a
@@ -71,12 +75,14 @@ export class ClaudeProvider implements ProviderAdapter {
       traceId: options.sessionId,
       cwd: options.cwd,
       resume: options.resumeProviderSessionId,
+      chrome: options.chrome,
       model: this.#options.model,
       permissionMode: this.#options.permissionMode,
       executable,
       queryFn: this.#options.queryFn ?? query,
       interruptTimeoutMs: this.#options.interruptTimeoutMs,
       authRetryDelaysMs: this.#options.authRetryDelaysMs,
+      limitRetryAfterResetMs: this.#options.limitRetryAfterResetMs,
     });
     sink.setProviderSessionId(session.sessionId);
     return session;
@@ -108,13 +114,18 @@ export class ClaudeProvider implements ProviderAdapter {
       const why = authRun.ok ? "unexpected output" : authRun.output || "no answer";
       return { available: false, version: versionText, detail: `could not check the Claude login (${why})` };
     }
-    return {
-      available: auth.loggedIn,
-      version: versionText,
-      detail: auth.loggedIn
-        ? `Logged in${auth.method ? ` (${auth.method})` : ""}`
-        : "not logged in: run `claude` on this machine and log in",
-    };
+    if (auth.loggedIn) {
+      return { available: true, version: versionText, detail: `Logged in${auth.method ? ` (${auth.method})` : ""}` };
+    }
+    // `claude auth status` only ever reports the OAuth /login credential — a machine
+    // running Claude Code entirely off an API key or a cloud provider's own credentials
+    // (screen reads "API Usage Billing" instead of a plan name) genuinely works and still
+    // gets loggedIn:false here, which used to read as "not logged in" even though nothing
+    // is actually wrong. Claude Code's own credential precedence below /login, checked in
+    // the same order (apiKeyAuth's own doc comment).
+    const apiKey = apiKeyAuth(this.#options.env ?? process.env);
+    if (apiKey) return { available: true, version: versionText, detail: `Logged in (${apiKey})` };
+    return { available: false, version: versionText, detail: "not logged in: run `claude` on this machine and log in" };
   }
 }
 
@@ -150,6 +161,24 @@ export function bundledClaudeExecutable(): string | null {
   } catch {
     // No module resolution from here (a single executable).
   }
+  return null;
+}
+
+/**
+ * Claude Code's own credential precedence below the OAuth /login this SDK never
+ * touches — cloud provider flags, then ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY,
+ * CLAUDE_CODE_OAUTH_TOKEN, checked in that order (Anthropic's own docs, "Authentication").
+ * `apiKeyHelper` (a settings.json script) is one step further down still and is not
+ * checked here — reading and running an arbitrary configured script just to label a probe
+ * result is more than this is worth; a machine set up that way keeps the plain "not logged
+ * in" wording instead of a wrong one.
+ */
+export function apiKeyAuth(env: NodeJS.ProcessEnv): string | null {
+  if (env.CLAUDE_CODE_USE_BEDROCK) return "AWS Bedrock";
+  if (env.CLAUDE_CODE_USE_VERTEX) return "Google Vertex AI";
+  if (env.ANTHROPIC_AUTH_TOKEN) return "ANTHROPIC_AUTH_TOKEN";
+  if (env.ANTHROPIC_API_KEY) return "ANTHROPIC_API_KEY";
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) return "CLAUDE_CODE_OAUTH_TOKEN";
   return null;
 }
 
