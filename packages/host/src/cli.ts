@@ -18,6 +18,7 @@ import { DEFAULT_SERVER, RelayHost, defaultRelaySession } from "./relay/relay-ho
 import { startLocalServer } from "./server/local-server.js";
 import { SessionManager } from "./session/manager.js";
 import { SessionStore, defaultStatePath } from "./session/store.js";
+import { checkForUpdate } from "./update-check.js";
 import { HostConsole, sessionEventLine, type RelayState } from "./ui/console.js";
 import { newId } from "./util/id.js";
 import { LockHeldError, acquirePidLock } from "./util/lock.js";
@@ -216,6 +217,11 @@ async function start(values: Values, server: string, credentialPath: string): Pr
   // What the host does, not where it can be reached: no addresses, ports or tokens
   // unless asked for with --show-local-url.
   ui.print(`termlink ${VERSION}`);
+  // Fire-and-forget: a courtesy notice if it lands, nothing if it doesn't. Never awaited, so a
+  // slow or unreachable registry can't delay startup — see update-check.ts.
+  void checkForUpdate(VERSION).then((line) => {
+    if (line) ui.event(line);
+  });
   ui.print(
     LOOPBACK.has(values.host)
       ? "  Local server: ready, for this computer only"

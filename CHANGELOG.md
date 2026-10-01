@@ -3,6 +3,16 @@
 All three packages (`@termlink/cli`, `@termlink/protocol`, `@termlink/terminal`) share one
 version number.
 
+## 0.1.5 - 2026-10-01
+
+- The relay heartbeat pings every 15s instead of 25s, well inside the 60s pong timeout, so a
+  single dropped packet no longer costs the whole connection — a real host saw its connection
+  die at almost exactly the 60s mark, repeatedly, the signature of a NAT or proxy evicting an
+  idle-looking connection around then.
+- `termlink` checks npm once a day for a newer `@termlink/cli` and prints a one-line notice at
+  startup if one is out. Never blocks or delays startup, and never throws on its own — offline,
+  a slow registry or a malformed response just mean no notice that run.
+
 ## 0.1.4 - 2026-09-20
 
 - A Claude session can start with `chrome: true` (`session.create`), spawning Claude Code

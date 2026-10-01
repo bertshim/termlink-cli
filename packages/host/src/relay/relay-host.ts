@@ -41,6 +41,14 @@ export interface RelayHostOptions {
 }
 
 const PONG_TIMEOUT_MS = 60_000;
+/**
+ * Well under PONG_TIMEOUT_MS, and not just barely: a real user's host saw connections die at
+ * almost exactly the 60s mark, repeatedly, over more than a week — the signature of a NAT or
+ * proxy evicting an idle-looking connection around then. Three ping/pong round-trips inside the
+ * deadline (instead of two at the old 25s) means a single dropped packet no longer costs the
+ * whole connection. The relay pings hosts on a shorter period for the same reason.
+ */
+const DEFAULT_PING_INTERVAL_MS = 15_000;
 
 interface Live {
   ws: WebSocket;
@@ -222,7 +230,7 @@ export class RelayHost {
     const heartbeat = setInterval(() => {
       if (Date.now() - lastPong > PONG_TIMEOUT_MS) ws.terminate();
       else ws.ping();
-    }, this.#options.pingIntervalMs ?? 25_000);
+    }, this.#options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS);
 
     this.#live = { ws, connection, coalescer, heartbeat };
     void connection.open();
