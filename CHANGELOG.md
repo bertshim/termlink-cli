@@ -3,6 +3,32 @@
 All three packages (`@termlink/cli`, `@termlink/protocol`, `@termlink/terminal`) share one
 version number.
 
+## 0.1.6 - 2026-10-03
+
+Three things Codex was already reporting, and one it already knew how to do, that
+never reached a client.
+
+- `SessionInfo.model` carries the model an agent session runs on, where its provider
+  says so. Codex reports it in the reply that opens its thread, and that reply was
+  being destructured without it. Cursor reports it the same way — `models.currentModelId`
+  on its `session/new` reply — and was losing it for the same reason; where a model is
+  configured, that one is reported instead, since `session/set_model` has just moved the
+  session onto it.
+- `SessionInfo.limits` carries how much of the account's plan is spent — a short
+  window and a long one, each with a used-percent and a reset. Codex has
+  `account/rateLimits/read` and pushes `account/rateLimits/updated` as they move.
+  Nothing was reaching them because account notifications name no thread, and the
+  router dropped anything it could not match to one; they now go to every thread on
+  the connection. The limits are also read once at thread start, since the pushes
+  only arrive when something changes.
+- `session.compact` asks the agent to summarise and carry on, through the provider's
+  own call (Codex: `thread/compact/start`). `ProviderStatus.compact` says who has one.
+  Clients used to send the literal text "/compact", which is a command to Claude Code
+  and an ordinary message to Codex — answered, convincingly, in prose.
+
+All three are session state or a real command rather than text typed at an agent, so
+a client reads them without asking and a second client sees the same thing.
+
 ## 0.1.5 - 2026-10-01
 
 - The relay heartbeat pings every 15s instead of 25s, well inside the 60s pong timeout, so a

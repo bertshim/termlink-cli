@@ -41,6 +41,8 @@ function fakeSink(events: AgentEvent[]): EventSink {
     emit: (type, payload) => events.push({ type, payload } as AgentEvent),
     requestInput: async () => ({ decisionId: null, effect: "cancel" }),
     setProviderSessionId: () => {},
+    setModel: () => {},
+    setLimits: () => {},
     messageRead: () => {},
     retryLater: () => {},
   };

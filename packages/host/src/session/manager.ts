@@ -103,6 +103,11 @@ export class SessionManager {
           // A client offers "resume this closed session" only for a provider
           // that can actually do it (session.create's own `resume` field).
           ...(provider.kind === "agent" && provider.resumable ? { resumable: true } : {}),
+          // Likewise: a client offers Compact as a real call only where there
+          // is one. Without this it would have to type the provider's own
+          // command as a message and hope it is a command there — which, for
+          // Codex over its app-server protocol, it is not.
+          ...(provider.kind === "agent" && provider.compact ? { compact: true } : {}),
         };
         try {
           return { ...identity, ...(await provider.probe()) };

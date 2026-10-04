@@ -22,6 +22,10 @@ export class FakeProvider implements ProviderAdapter {
   readonly id = "fake";
   readonly kind = "agent" as const;
   readonly label = "Fake agent";
+  /** It has a real call for it, as Codex does — so a client test can tell the
+   *  two paths apart: the command must leave nothing in the transcript, while
+   *  a typed "/compact" shows up as a message. */
+  readonly compact = true;
   readonly steer: boolean;
   readonly #stepDelayMs: number;
   readonly #interruptDelayMs: number;
@@ -38,9 +42,26 @@ export class FakeProvider implements ProviderAdapter {
 
   async start(options: StartOptions, sink: EventSink): Promise<ProviderSession> {
     sink.setProviderSessionId(newId("fake"));
+    // Reported at start, the way Codex reports it in its thread/start reply —
+    // the case SessionInfo.model exists for, and the only way a client test
+    // can see that path without a real Codex on the machine.
+    sink.setModel("fake-model-1");
+    // And the plan's usage, the way Codex reports it: a short window and a
+    // long one, each a used-percent with a reset time. Fixed numbers so a
+    // client test can assert on them.
+    sink.setLimits({
+      primary: { usedPercent: 42, resetsAt: Date.now() + 3 * 60 * 60 * 1000, windowMinutes: 300 },
+      secondary: { usedPercent: 17, resetsAt: Date.now() + 4 * 24 * 60 * 60 * 1000, windowMinutes: 10080 },
+      plan: "fake-plan",
+    });
     const session = new FakeSession(options.cwd, sink, this.#stepDelayMs, this.#interruptDelayMs);
     if (this.steer) return session;
-    return { send: (input) => session.send(input), interrupt: () => session.interrupt(), close: () => session.close() };
+    return {
+      send: (input) => session.send(input),
+      interrupt: () => session.interrupt(),
+      compact: () => session.compact(),
+      close: () => session.close(),
+    };
   }
 }
 
@@ -75,6 +96,13 @@ class FakeSession implements ProviderSession {
     this.#sink = sink;
     this.#delayMs = delayMs;
     this.#interruptDelayMs = interruptDelayMs;
+  }
+
+  /** A real compaction call rather than a message, as Codex's is. It says so
+   *  through the sink and leaves nothing in the transcript, which is how a
+   *  test tells it apart from a typed "/compact". */
+  async compact(): Promise<void> {
+    this.#sink.emit("provider.event", { name: "fake.compacted", data: {} });
   }
 
   async send(input: UserInput): Promise<void> {

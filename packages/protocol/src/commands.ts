@@ -68,6 +68,17 @@ export const SessionDetachCommand = command("session.detach", SessionRef.extend(
 export const SessionSendCommand = command("session.send", SessionRef.extend({ input: UserInput }));
 export const SessionInterruptCommand = command("session.interrupt", SessionRef);
 export const SessionCloseCommand = command("session.close", SessionRef);
+/**
+ * Asks the agent to summarise what it has so far and carry on from the summary.
+ * Only for a provider whose ProviderStatus says `compact`.
+ *
+ * A command rather than a typed message, because for some providers it is not a
+ * message at all. Claude Code reads a literal "/compact" sent to it; Codex over
+ * its app-server protocol reads that as ordinary text and answers it in prose,
+ * while having a real call for the job (thread/compact/start). This is how the
+ * real call gets used where there is one.
+ */
+export const SessionCompactCommand = command("session.compact", SessionRef);
 /** Changes agent session settings. Changing autoApprove also applies to approvals already waiting. */
 export const SessionConfigureCommand = command("session.configure", SessionRef.extend({ autoApprove: AutoApprove.optional() }));
 export const InputRespondCommand = command(
@@ -157,6 +168,7 @@ export const Command = z.discriminatedUnion("type", [
   SessionSendCommand,
   SessionInterruptCommand,
   SessionCloseCommand,
+  SessionCompactCommand,
   SessionConfigureCommand,
   InputRespondCommand,
   TerminalResizeCommand,
@@ -190,6 +202,9 @@ export interface CommandResults {
   "session.send": Empty;
   "session.interrupt": Empty;
   "session.close": Empty;
+  /** Answered once the compaction has been asked for, not once it has finished;
+   *  the turn it produces is reported through events like any other. */
+  "session.compact": Empty;
   "session.configure": { session: SessionInfo };
   "input.respond": Empty;
   "terminal.resize": { session: SessionInfo };

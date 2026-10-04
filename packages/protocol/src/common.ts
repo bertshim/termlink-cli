@@ -48,6 +48,37 @@ export const TerminalSize = z.object({
 });
 export type TerminalSize = z.infer<typeof TerminalSize>;
 
+/**
+ * One metered window of the plan an agent session runs on: how much of it is
+ * spent, and when it starts again.
+ *
+ * `resetsAt` is epoch MILLISECONDS, like every other time in this protocol —
+ * a provider reporting seconds converts on the way in.
+ */
+export const UsageWindow = z.object({
+  usedPercent: z.number(),
+  resetsAt: z.number().nullable().optional(),
+  /** How long the window is, where the provider says — 300 for a 5-hour one. */
+  windowMinutes: z.number().nullable().optional(),
+});
+export type UsageWindow = z.infer<typeof UsageWindow>;
+
+/**
+ * The plan limits behind an agent session, where its provider reports them.
+ *
+ * Two windows rather than named ones ("5-hour", "weekly") because the names
+ * are the provider's business and change with the plan: `primary` is the short
+ * window and `secondary` the long one, which is the shape Codex reports and
+ * the order any client should draw them in.
+ */
+export const UsageLimits = z.object({
+  primary: UsageWindow.nullable().optional(),
+  secondary: UsageWindow.nullable().optional(),
+  /** The plan's own name, where given — "plus", "pro", "team". */
+  plan: z.string().nullable().optional(),
+});
+export type UsageLimits = z.infer<typeof UsageLimits>;
+
 export const SessionInfo = z.object({
   id: z.string(),
   kind: SessionKind,
@@ -61,6 +92,28 @@ export const SessionInfo = z.object({
   updatedAt: z.number(),
   /** Highest seq emitted on this session so far. Always 0 for terminals, which have no replay log. */
   lastSeq: z.number().int(),
+  /**
+   * Agent sessions: the model this session actually runs on, once its provider
+   * has said so — Codex reports it in the reply that opens the thread.
+   *
+   * State, not an event, for the same reason rateLimit below is: it holds for
+   * the life of the session, so a client that connects later still needs it.
+   * Absent where the provider never reports one; a client that wants a model
+   * name from such a provider has to ask the agent itself (Claude Code answers
+   * `/model`, which is what the TermLink web client does there).
+   */
+  model: z.string().optional(),
+  /**
+   * Agent sessions: how much of the account's plan this session's provider says
+   * is spent, and when it resets. State for the same reason `model` is — it is
+   * true of the account for as long as the session lives, and a client that
+   * connects later still needs it.
+   *
+   * Codex reports it (`account/rateLimits/read`, then pushes as it moves).
+   * Absent where the provider does not; Claude answers `/usage` instead, which
+   * is a question a client has to ask rather than state the host can carry.
+   */
+  limits: UsageLimits.optional(),
   /** Agent sessions only. */
   autoApprove: AutoApprove.optional(),
   /** Agent sessions: messages sent during the running turn that the agent has not read yet. */
@@ -101,6 +154,16 @@ export const ProviderStatus = z.object({
    * empty. Absent means the provider can't — a client should not offer it.
    */
   resumable: z.boolean().optional(),
+  /**
+   * Its agent sessions can be compacted with `session.compact` — the agent
+   * summarises what it has so far and carries on from the summary.
+   *
+   * Absent means it has no such call, and a client that wants the behaviour
+   * has to type the provider's own command at it as a message (Claude Code
+   * answers "/compact"). It must NOT do that blindly: a provider without a
+   * command by that name reads it as ordinary text and replies in prose.
+   */
+  compact: z.boolean().optional(),
 });
 export type ProviderStatus = z.infer<typeof ProviderStatus>;
 

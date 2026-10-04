@@ -178,7 +178,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       send({ id: message.id, result: {} });
       break;
     case "session/new":
-      send({ id: message.id, result: { sessionId: `ses_${process.pid}_${++sessionCount}` } });
+      // `models` alongside the id, the way the real cursor-agent replies — it
+      // is where the account's current model comes from when none is
+      // configured, and it used to be destructured away.
+      send({
+        id: message.id,
+        result: {
+          sessionId: `ses_${process.pid}_${++sessionCount}`,
+          models: {
+            currentModelId: "fake-cursor-auto",
+            availableModels: [{ modelId: "fake-cursor-auto", name: "Auto" }],
+          },
+        },
+      });
       break;
     case "session/load":
       replay(String(params.sessionId), message.id);

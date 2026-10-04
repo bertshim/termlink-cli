@@ -208,6 +208,10 @@ test("a configured model is applied to a new Cursor session with session/set_mod
       const session = await manager.createAgent({ provider: "cursor", cwd: tmpdir() });
       const log = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, { modelId: string }[]>;
       assert.deepEqual(log[`__model__${session.info.providerSessionId}`], [{ modelId: "claude-haiku-4-5[thinking=true]" }]);
+      // And it is what SessionInfo reports, not the `models.currentModelId`
+      // the session/new reply carried: set_model has just switched the session
+      // off that, so the reply's answer is already stale.
+      assert.equal(session.info.model, "claude-haiku-4-5[thinking=true]");
     } finally {
       await manager.shutdown();
     }
@@ -232,6 +236,9 @@ test("no model configured means no session/set_model call", async () => {
         // Not written at all is the expected, best outcome.
       }
       assert.equal(log[`__model__${session.info.providerSessionId}`], undefined);
+      // With nothing configured, the account's own current model is what the
+      // session/new reply said — the field that used to be destructured away.
+      assert.equal(session.info.model, "fake-cursor-auto");
     } finally {
       await manager.shutdown();
     }

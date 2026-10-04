@@ -8,6 +8,12 @@ import { JsonRpcPeer, RpcError } from "./rpc.js";
 export interface ThreadHandler {
   notification(method: string, params: unknown): void;
   request(method: string, params: unknown, id: RequestId): Promise<unknown>;
+  /**
+   * A notification that named no thread — it is about the signed-in ACCOUNT
+   * (`account/rateLimits/updated`), which every thread on this connection
+   * shares, so each of them hears it.
+   */
+  accountNotification?(method: string, params: unknown): void;
   /** The app-server went away. */
   closed(reason: Error): void;
 }
@@ -26,7 +32,18 @@ export class CodexAppServer {
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.#child = child;
     this.peer = new JsonRpcPeer(child.stdout, child.stdin);
-    this.peer.onNotification = (method, params) => this.#threadFor(params)?.notification(method, params);
+    this.peer.onNotification = (method, params) => {
+      const thread = this.#threadFor(params);
+      if (thread) {
+        thread.notification(method, params);
+        return;
+      }
+      // No threadId on it. Account-level notifications are the ones shaped
+      // that way — one signed-in account behind every thread here — and they
+      // used to fall on the floor silently, which is how the plan's own usage
+      // went unreported for the whole life of this provider.
+      for (const t of this.#threads.values()) t.accountNotification?.(method, params);
+    };
     this.peer.onRequest = async (method, params, id) => {
       const thread = this.#threadFor(params);
       if (!thread) throw new RpcError(-32601, `${method} has no thread on this client`);

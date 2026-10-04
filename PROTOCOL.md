@@ -110,6 +110,7 @@ command, because what a person approves must be the string that will run.
 | `session.send` | `{sessionId, input: {text, id?}}` | `{}` once the host has taken the message. The turn itself is reported through events |
 | `session.interrupt` | `{sessionId}` | `{}` after `turn.completed` has gone out |
 | `session.close` | `{sessionId}` | `{}` |
+| `session.compact` | `{sessionId}` | `{}` once the agent has taken it; the turn it produces is reported through events. Only on a provider whose `ProviderStatus.compact` says so — `unsupported` otherwise |
 | `session.configure` | `{sessionId, autoApprove?}` | `{session}` |
 | `input.respond` | `{sessionId, requestId, decisionId, answers?}` | `{}` |
 | `terminal.resize` | `{sessionId, cols, rows}` | `{session}` |
@@ -203,6 +204,36 @@ Each agent session has a mode for answering approvals by itself (`SessionInfo.au
   change also applies to requests already waiting. The host's default comes from
   `--auto-approve`.
 - It is a convenience, not a security boundary.
+
+## Compaction
+
+`session.compact` asks the agent to summarise what it has so far and carry on from the
+summary. It exists because this is not a message everywhere.
+
+- Claude Code reads a literal `/compact` sent to it as a message, so there it is one.
+- Codex here runs over its app-server protocol, not its interactive CLI. `/compact` sent
+  as a message is just text, and comes back as prose about a terminal command. Its real
+  call is `thread/compact/start`, which is what this command uses.
+
+`ProviderStatus.compact` says which providers have the real call. A client must branch on
+it rather than typing a provider's own command at an agent that has no such command — the
+reply looks like an answer and is not one.
+
+## Model
+
+`SessionInfo.model` carries the model an agent session is actually running on, where
+its provider says so. It is session state rather than an event, like `rateLimit` below:
+it holds for the life of the session, so a client that connects afterwards still sees it
+on `session.list` or its next attach.
+
+- Codex reports it in the reply that opens the thread, so it is set before the first
+  turn and announced with `session.updated`.
+- Absent where the provider never reports one. Claude does not; a client that wants the
+  model name there has to ask the agent itself, which answers `/model`.
+- Clients must not send a provider's own slash commands blindly to get this. Codex here
+  runs over its app-server protocol, not its interactive CLI, so `/status` and `/model`
+  are not commands at all — they reach the model as ordinary text and come back as
+  invented prose.
 
 ## Session status
 

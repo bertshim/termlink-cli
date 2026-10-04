@@ -188,6 +188,40 @@ export interface ThreadTokenUsageUpdatedNotification {
   tokenUsage: { total: TokenUsageBreakdown; last: TokenUsageBreakdown };
 }
 
+/**
+ * One metered window of the signed-in account's plan. Codex reports a short
+ * one and a long one — its own TUI draws them as the 5-hour and weekly limits
+ * on `/status`. `resetsAt` is epoch SECONDS where the backend supplied it.
+ */
+export interface RateLimitWindow {
+  usedPercent: number;
+  resetsAt?: number | null;
+  windowDurationMins?: number | null;
+}
+
+export interface RateLimitSnapshot {
+  primary?: RateLimitWindow | null;
+  secondary?: RateLimitWindow | null;
+  planType?: string | null;
+}
+
+/** The reply to `account/rateLimits/read`. */
+export interface GetAccountRateLimitsResponse {
+  rateLimits: RateLimitSnapshot;
+}
+
+/**
+ * `account/rateLimits/updated` — pushed as the account's usage moves.
+ *
+ * ACCOUNT-level, so unlike everything else here it carries no `threadId`: one
+ * signed-in account is shared by every thread on this app-server connection.
+ * The snapshot is sparse — a rolling update may omit fields it has nothing new
+ * to say about, and omitting one does NOT mean it has gone away.
+ */
+export interface AccountRateLimitsUpdatedNotification {
+  rateLimits: RateLimitSnapshot;
+}
+
 export interface ErrorNotification {
   threadId: string;
   turnId: string;

@@ -102,8 +102,9 @@ export class CursorProvider implements ProviderAdapter {
       server.register(sessionId, session);
       try {
         const params: SessionLoadParams = { sessionId, cwd: options.cwd, mcpServers: [] };
-        await server.peer.request<SessionLoadResponse>("session/load", params);
+        const loaded = await server.peer.request<SessionLoadResponse>("session/load", params);
         await this.#applySettings(server, sessionId);
+        this.#reportModel(sink, loaded?.models?.currentModelId);
       } catch (err) {
         server.unregister(sessionId);
         throw err;
@@ -113,8 +114,9 @@ export class CursorProvider implements ProviderAdapter {
       return session;
     }
     const params: SessionNewParams = { cwd: options.cwd, mcpServers: [] };
-    const { sessionId } = await server.peer.request<SessionNewResponse>("session/new", params);
+    const { sessionId, models } = await server.peer.request<SessionNewResponse>("session/new", params);
     await this.#applySettings(server, sessionId);
+    this.#reportModel(sink, models?.currentModelId);
     const session = new CursorAcpSession(server, sessionId, sink, options.cwd, {
       interruptTimeoutMs: this.#options.interruptTimeoutMs,
     });
@@ -130,6 +132,23 @@ export class CursorProvider implements ProviderAdapter {
    * session is handed back so the very first turn already uses them, on a fresh session and
    * a resumed one alike.
    */
+  /**
+   * Which model this session is actually on, for SessionInfo.model.
+   *
+   * A configured one wins over what the reply said: #applySettings has just
+   * switched the session onto it with session/set_model, so the reply's
+   * `currentModelId` is already out of date by the time this runs. With
+   * nothing configured the reply is the answer — the account's own default,
+   * "Auto" unless it was changed elsewhere.
+   *
+   * Silent when neither is known. An older cursor-agent that does not report
+   * `models` should leave the model blank rather than have this guess.
+   */
+  #reportModel(sink: EventSink, reported: string | undefined): void {
+    const model = this.#options.model ?? reported;
+    if (model) sink.setModel(model);
+  }
+
   async #applySettings(server: CursorAcpServer, sessionId: string): Promise<void> {
     // Two independent session settings — nothing about one needs the other to have already
     // landed, so both go out together rather than paying two round trips in series.

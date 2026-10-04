@@ -97,6 +97,30 @@ export class AgentSession {
       this.#info.providerSessionId = id;
       this.#announce("session.updated");
     },
+    // Guarded on a real change: a provider that reports the model on every
+    // resume as well as every start would otherwise announce a session.updated
+    // that says nothing, to every connected client.
+    setModel: (model) => {
+      if (!model || this.#info.model === model) return;
+      this.#info.model = model;
+      this.#announce("session.updated");
+    },
+    // Merged field by field, and only announced when something actually
+    // moved: Codex's rolling updates are sparse, so a window missing from one
+    // means "nothing new", not "gone" — replacing wholesale would blank a
+    // bar that is still perfectly true, and announcing regardless would push
+    // an identical snapshot to every client on every turn.
+    setLimits: (limits) => {
+      const next = {
+        ...this.#info.limits,
+        ...(limits.primary !== undefined ? { primary: limits.primary } : {}),
+        ...(limits.secondary !== undefined ? { secondary: limits.secondary } : {}),
+        ...(limits.plan !== undefined ? { plan: limits.plan } : {}),
+      };
+      if (JSON.stringify(next) === JSON.stringify(this.#info.limits ?? {})) return;
+      this.#info.limits = next;
+      this.#announce("session.updated");
+    },
     messageRead: (itemId) => this.#settleQueued(itemId, "read"),
     retryLater: (delayMs, input, info) => this.#retryLater(delayMs, input, info),
   };
@@ -296,6 +320,24 @@ export class AgentSession {
    * its own" Stop already means for a running turn, just nothing left to wait out.
    * A plain no-op otherwise, as before.
    */
+  /**
+   * Summarise what the agent has so far and carry on from the summary.
+   *
+   * Only for a provider whose adapter says `compact` — the others have no call
+   * for it, and a client wanting the behaviour there types the provider's own
+   * command at it as an ordinary message (Claude Code answers "/compact").
+   * Refused rather than silently ignored, so a client cannot believe it
+   * compacted something it did not.
+   */
+  async compact(): Promise<void> {
+    if (this.closed) throw new HostError("conflict", "session is closed");
+    const provider = await this.#ensureProvider();
+    if (!provider.compact) {
+      throw new HostError("unsupported", `${this.#info.provider} sessions can't be compacted`);
+    }
+    await provider.compact();
+  }
+
   async interrupt(): Promise<void> {
     if (this.closed) throw new HostError("conflict", "session is closed");
     if (!this.#turnActive) {

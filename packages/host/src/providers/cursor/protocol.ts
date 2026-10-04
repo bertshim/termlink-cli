@@ -38,8 +38,24 @@ export interface SessionNewParams {
   mcpServers: unknown[];
 }
 
+/**
+ * What cursor-agent offers for this session, and which of them it is on.
+ *
+ * Already documented in CursorProviderOptions.model, which names
+ * `models.availableModels[].modelId` and `models.currentModelId` as the live
+ * shape — it was just never declared here, so the reply was destructured for
+ * its sessionId and the rest dropped. Every field optional: this is another
+ * process's reply, and an older or newer cursor-agent that omits it should
+ * leave the model unknown rather than break the session.
+ */
+export interface SessionModels {
+  currentModelId?: string;
+  availableModels?: { modelId: string; name?: string }[];
+}
+
 export interface SessionNewResponse {
   sessionId: string;
+  models?: SessionModels;
 }
 
 /**
@@ -56,7 +72,8 @@ export interface SessionLoadParams {
   mcpServers: unknown[];
 }
 
-export type SessionLoadResponse = Record<string, unknown>;
+/** Loosely typed on purpose — only `models` is read, and only when it is there. */
+export type SessionLoadResponse = Record<string, unknown> & { models?: SessionModels };
 
 /** Switches the model an existing session uses for its next prompt — live-verified: a
  *  session started on GPT-5.1 answered "which model are you" as Claude Haiku 4.5 right

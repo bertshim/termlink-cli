@@ -4,7 +4,7 @@ import type { EventSink, HistoryTurn, ProbeResult, ProviderAdapter, ProviderSess
 import { CodexAppServer } from "./app-server.js";
 import { resolveCodexCommand, type CodexCommand } from "./command.js";
 import { codexHistory } from "./history.js";
-import type { AskForApproval, SandboxMode, ThreadResumeParams, ThreadStartParams, ThreadStartResponse } from "./protocol.js";
+import type { AskForApproval, GetAccountRateLimitsResponse, SandboxMode, ThreadResumeParams, ThreadStartParams, ThreadStartResponse } from "./protocol.js";
 import { CodexThreadSession } from "./session.js";
 
 export interface CodexProviderOptions {
@@ -31,6 +31,7 @@ export class CodexProvider implements ProviderAdapter {
   readonly label = "Codex";
   readonly resumable = true;
   readonly steer = true;
+  readonly compact = true;
   readonly #options: CodexProviderOptions;
   #server: Promise<CodexAppServer> | null = null;
   #probe: { until: number; status: ProbeResult } | null = null;
@@ -53,7 +54,11 @@ export class CodexProvider implements ProviderAdapter {
       ...(this.#options.approvalPolicy ? { approvalPolicy: this.#options.approvalPolicy } : {}),
       ...(this.#options.sandbox ? { sandbox: this.#options.sandbox } : {}),
     };
-    const { thread } = options.resumeProviderSessionId
+    // `model` was being destructured away here, and it is the only place Codex
+    // ever says which model the thread runs on — there is no /status to ask
+    // later, because this is the app-server protocol and not the interactive
+    // CLI, where a slash command would just be sent to the model as text.
+    const { thread, model } = options.resumeProviderSessionId
       ? await server.peer.request<ThreadStartResponse>("thread/resume", {
           ...params,
           threadId: options.resumeProviderSessionId,
@@ -63,6 +68,16 @@ export class CodexProvider implements ProviderAdapter {
     const session = new CodexThreadSession(server, thread.id, sink);
     server.register(thread.id, session);
     sink.setProviderSessionId(thread.id);
+    if (model) sink.setModel(model);
+    // The plan's usage, once, now. The pushes (account/rateLimits/updated)
+    // only arrive when something moves, so a session opened in the middle of
+    // a window would show nothing at all until its first turn finished.
+    // Fire-and-forget: an account read that fails is a missing gauge, not a
+    // reason to refuse to open the session.
+    void server.peer
+      .request<GetAccountRateLimitsResponse>("account/rateLimits/read", {})
+      .then((res) => session.applyRateLimits(res?.rateLimits))
+      .catch(() => {});
     return session;
   }
 

@@ -19,6 +19,9 @@ import type {
   ServerRequestResolvedNotification,
   ThreadItem,
   ThreadTokenUsageUpdatedNotification,
+  AccountRateLimitsUpdatedNotification,
+  RateLimitSnapshot,
+  RateLimitWindow,
   TokenUsageBreakdown,
   Turn,
   TurnNotification,
@@ -103,6 +106,21 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
     if (read) this.#sink.messageRead(read.itemId);
   }
 
+  /**
+   * Summarise the thread and carry on from the summary — Codex's own
+   * thread/compact/start, not a "/compact" typed at it. Over the app-server
+   * protocol that string is ordinary text: Codex reads it, decides it is being
+   * asked about a terminal command, and answers in prose.
+   *
+   * The compaction runs as a turn of its own and reports through the same
+   * notifications any turn does, so there is nothing to wait for here beyond
+   * Codex accepting it.
+   */
+  async compact(): Promise<void> {
+    if (this.#closed) throw new HostError("conflict", "codex session is closed");
+    await this.#server.peer.request("thread/compact/start", { threadId: this.threadId });
+  }
+
   async interrupt(): Promise<void> {
     const turnId = this.#turnId;
     if (!turnId) return;
@@ -180,6 +198,9 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
       case "thread/tokenUsage/updated":
         this.#totals = (params as ThreadTokenUsageUpdatedNotification).tokenUsage.total;
         break;
+      case "account/rateLimits/updated":
+        this.applyRateLimits((params as AccountRateLimitsUpdatedNotification).rateLimits);
+        break;
       case "error": {
         const { error, willRetry } = params as ErrorNotification;
         if (willRetry) this.#sink.emit("provider.event", { name: "codex.retrying", data: { message: error.message } });
@@ -192,6 +213,47 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
         break;
       }
     }
+  }
+
+  /**
+   * An account-level notification, which names no thread and so reaches every
+   * thread on this connection (CodexAppServer). Only the rate limits matter
+   * here; the rest of the account surface is the CLI's own business.
+   */
+  accountNotification(method: string, params: unknown): void {
+    if (method !== "account/rateLimits/updated") return;
+    this.applyRateLimits((params as AccountRateLimitsUpdatedNotification).rateLimits);
+  }
+
+  /**
+   * Hand a snapshot of the plan's usage to the host session.
+   *
+   * Also the way the first one arrives: the provider reads it once with
+   * `account/rateLimits/read` when the thread opens, because the pushes only
+   * start when something moves and a session opened mid-window would
+   * otherwise show nothing until the next turn.
+   *
+   * Codex reports `resetsAt` in SECONDS; this protocol is milliseconds
+   * throughout, so it is converted here rather than left for each client to
+   * discover the hard way.
+   */
+  applyRateLimits(snapshot: RateLimitSnapshot | null | undefined): void {
+    if (!snapshot) return;
+    const window = (w: RateLimitWindow | null | undefined) =>
+      w === undefined
+        ? undefined
+        : w === null
+          ? null
+          : {
+              usedPercent: w.usedPercent,
+              resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null,
+              windowMinutes: w.windowDurationMins ?? null,
+            };
+    this.#sink.setLimits({
+      ...(snapshot.primary !== undefined ? { primary: window(snapshot.primary) } : {}),
+      ...(snapshot.secondary !== undefined ? { secondary: window(snapshot.secondary) } : {}),
+      ...(snapshot.planType !== undefined ? { plan: snapshot.planType } : {}),
+    });
   }
 
   async request(method: string, params: unknown, id: RequestId): Promise<unknown> {

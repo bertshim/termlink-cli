@@ -5,6 +5,7 @@ import type {
   Item,
   ProviderId,
   ProviderStatus,
+  UsageLimits,
   UserInput,
 } from "@termlink/protocol";
 import type { Terminal } from "@termlink/terminal";
@@ -40,6 +41,25 @@ export interface EventSink {
    */
   requestInput(request: Omit<InputRequest, "requestId">, signal?: AbortSignal): Promise<InputResponse>;
   setProviderSessionId(id: string): void;
+  /**
+   * The model this session is actually running on, once the provider knows it.
+   *
+   * Session STATE rather than an event, for the reason SessionInfo.rateLimit
+   * gives for being state too: it is true for as long as the session lives, so
+   * a client that was not connected when it was first reported still has to
+   * see it — on session.list, or on its next attach. Codex reports it in its
+   * thread/start reply; a provider that never calls this simply has no model
+   * to show, and SessionInfo.model stays absent.
+   */
+  setModel(model: string): void;
+  /**
+   * How much of the account's plan is spent, where the provider reports it —
+   * SessionInfo.limits. Session state for the same reason setModel's is.
+   *
+   * Merged, not replaced: Codex's rolling updates are sparse, and a window
+   * missing from one of them means "nothing new to say", not "gone".
+   */
+  setLimits(limits: UsageLimits): void;
   /** A message steered into the turn (its item id, as given to steer()) has reached the agent. */
   messageRead(itemId: string): void;
   /**
@@ -80,6 +100,14 @@ export interface ProviderSession {
    */
   steer?(input: UserInput, itemId: string): Promise<void>;
   /**
+   * Summarise the conversation so far and carry on from the summary, as a real
+   * call rather than a message typed at the agent (Codex: thread/compact/start).
+   * Present only on providers whose adapter sets `compact`; the rest have no
+   * such call, and a client that wants it there sends the provider's own
+   * command as ordinary text instead.
+   */
+  compact?(): Promise<void>;
+  /**
    * Resolves after the running turn has emitted turn.completed. Must resolve within a
    * bounded time whatever the agent does: the host session is `interrupting` meanwhile.
    */
@@ -104,6 +132,9 @@ export interface ProviderAdapter {
   readonly resumable?: boolean;
   /** Its sessions take messages while a turn runs (ProviderSession.steer). */
   readonly steer?: boolean;
+  /** Its sessions have a real call for compaction (ProviderSession.compact),
+   *  rather than a command a client has to type at the agent. */
+  readonly compact?: boolean;
   probe(): Promise<ProbeResult>;
   start(options: StartOptions, sink: EventSink): Promise<ProviderSession>;
   /** Recent turns of a stored session, oldest first. */

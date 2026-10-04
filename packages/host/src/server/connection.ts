@@ -161,6 +161,9 @@ export class ClientConnection {
       case "session.close":
         await this.#manager.close(command.payload.sessionId, "closed by client");
         return this.#ok(reqId, command.type, {});
+      case "session.compact":
+        await this.#manager.agent(command.payload.sessionId).compact();
+        return this.#ok(reqId, command.type, {});
       case "session.configure": {
         const { sessionId, ...settings } = command.payload;
         const session = this.#manager.agent(sessionId);
