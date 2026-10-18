@@ -13,6 +13,8 @@ export interface CodexProviderOptions {
   /** Leave unset to use the user's ~/.codex/config.toml. */
   approvalPolicy?: AskForApproval;
   sandbox?: SandboxMode;
+  /** How long past a usage limit's own reset to resend the failed turn. For tests; a minute otherwise. */
+  limitRetryAfterResetMs?: number;
 }
 
 // A good status is kept a minute; a bad one is re-checked soon, since a slow first run
@@ -65,7 +67,9 @@ export class CodexProvider implements ProviderAdapter {
           excludeTurns: true,
         } satisfies ThreadResumeParams)
       : await server.peer.request<ThreadStartResponse>("thread/start", params);
-    const session = new CodexThreadSession(server, thread.id, sink);
+    const session = new CodexThreadSession(server, thread.id, sink, {
+      limitRetryAfterResetMs: this.#options.limitRetryAfterResetMs,
+    });
     server.register(thread.id, session);
     sink.setProviderSessionId(thread.id);
     if (model) sink.setModel(model);

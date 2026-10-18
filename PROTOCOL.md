@@ -256,15 +256,22 @@ usage-limit hit is armed (see "Rate limits" below), `running` otherwise.
 
 The Claude Agent SDK's `query()` has no built-in behaviour for a plan's usage limit: a turn that
 hits one just ends, failed, like any other error — the interactive CLI's own auto-restart-at-reset
-is not something `query()` does on its own. The host supplies it instead (Claude only, for now).
+is not something `query()` does on its own. Codex over its app-server protocol is the same: the
+turn ends `failed` with "You've hit your usage limit ...". The host supplies the wait for both
+(Claude and Codex; the other providers do not report a usage limit).
 
-- A failed turn whose error is a genuine usage-limit hit — Claude Code's own API error code
-  `rate_limit`, or its result text starting with one of its own "genuinely reached" prefixes —
-  is resent automatically, once, past the limit's own reset.
-- The reset time comes from the SDK's own `rate_limit_event` frame when one has arrived
-  (`status: "rejected"`, `resetsAt`); failing that, the host parses it out of the CLI's own
-  sentence ("... resets 7:30pm (Asia/Seoul)"). If neither gives a usable time, the turn just
-  stays `failed`, as it always did.
+- A failed turn whose error is a genuine usage-limit hit — for Claude, Claude Code's own API error
+  code `rate_limit`, or its result text starting with one of its own "genuinely reached" prefixes;
+  for Codex, an error starting "You've hit your usage limit" — is resent automatically, past the
+  limit's own reset.
+- The reset time comes from the provider's own structured signal when it has one: Claude's
+  `rate_limit_event` frame (`status: "rejected"`, `resetsAt`), or Codex's rate-limit windows
+  (`account/rateLimits/updated`, a window at 100% and its `resetsAt` — the later one if both are
+  full). Failing that, the host parses it out of the provider's own sentence: Claude's
+  "... resets 7:30pm (Asia/Seoul)", or Codex's "... or try again at 6:54 PM." (read in this
+  machine's own time zone, since the sentence names none; a limit further out reads
+  "Oct 9th, 2026 6:54 PM"). If neither gives a usable time, the turn just stays `failed`, as it
+  always did.
 - The resend happens a minute past that reset, not exactly at it — long enough that the reset has
   genuinely landed server-side.
 - The wait is real session state, not a one-shot event: status is `rate_limited` and

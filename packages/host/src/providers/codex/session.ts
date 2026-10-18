@@ -31,9 +31,15 @@ import type {
   TurnSteerParams,
   TurnSteerResponse,
 } from "./protocol.js";
+import { isUsageLimitError, MAX_LIMIT_RETRIES, RETRY_AFTER_RESET_MS, resolveRetryAt, type LimitWindows } from "./rate-limit.js";
 import { NO_RESPONSE, RpcError } from "./rpc.js";
 
 const INTERRUPT_TIMEOUT_MS = 10_000;
+
+export interface CodexSessionOptions {
+  /** How long past the limit's own reset to resend; RETRY_AFTER_RESET_MS unless a test shortens it. */
+  limitRetryAfterResetMs?: number | undefined;
+}
 
 /** One Codex thread, driven through the shared app-server. */
 export class CodexThreadSession implements ProviderSession, ThreadHandler {
@@ -52,11 +58,23 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
   #totals: TokenUsageBreakdown | null = null;
   #totalsAtTurnStart: TokenUsageBreakdown | null = null;
   #closed = false;
+  /**
+   * The message the running turn was started with, kept so a turn that fails on the plan's
+   * usage limit can be sent again (see #maybeRetryLimit). Null for a turn the host did not
+   * start with a message of its own — a compaction, or one Codex began itself.
+   */
+  #turnText: string | null = null;
+  /** The plan's usage windows as last reported; what #maybeRetryLimit reads the reset from. */
+  #limits: LimitWindows = {};
+  /** How many turns in the current run of usage-limit hits have been resent; see MAX_LIMIT_RETRIES. */
+  #limitRetries = 0;
+  readonly #limitRetryAfterReset: number;
 
-  constructor(server: CodexAppServer, threadId: string, sink: EventSink) {
+  constructor(server: CodexAppServer, threadId: string, sink: EventSink, options: CodexSessionOptions = {}) {
     this.#server = server;
     this.threadId = threadId;
     this.#sink = sink;
+    this.#limitRetryAfterReset = options.limitRetryAfterResetMs ?? RETRY_AFTER_RESET_MS;
   }
 
   async send(input: UserInput): Promise<void> {
@@ -66,8 +84,15 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
       threadId: this.threadId,
       input: [{ type: "text", text: input.text, text_elements: [] }],
     };
-    const { turn } = await this.#server.peer.request<TurnStartResponse>("turn/start", params);
-    this.#beginTurn(turn.id);
+    this.#turnText = input.text;
+    try {
+      const { turn } = await this.#server.peer.request<TurnStartResponse>("turn/start", params);
+      this.#beginTurn(turn.id);
+    } catch (err) {
+      // No turn began, so nothing for a later one to be mistaken for a resend of.
+      if (!this.#turnId) this.#turnText = null;
+      throw err;
+    }
   }
 
   /**
@@ -118,6 +143,8 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
    */
   async compact(): Promise<void> {
     if (this.#closed) throw new HostError("conflict", "codex session is closed");
+    // Not a message to resend if it hits the limit.
+    this.#turnText = null;
     await this.#server.peer.request("thread/compact/start", { threadId: this.threadId });
   }
 
@@ -249,9 +276,18 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
               resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null,
               windowMinutes: w.windowDurationMins ?? null,
             };
+    const primary = window(snapshot.primary);
+    const secondary = window(snapshot.secondary);
+    // Merged the same sparse way the session merges them: a window left out of an
+    // update has not gone away.
+    this.#limits = {
+      ...this.#limits,
+      ...(primary !== undefined ? { primary } : {}),
+      ...(secondary !== undefined ? { secondary } : {}),
+    };
     this.#sink.setLimits({
-      ...(snapshot.primary !== undefined ? { primary: window(snapshot.primary) } : {}),
-      ...(snapshot.secondary !== undefined ? { secondary: window(snapshot.secondary) } : {}),
+      ...(primary !== undefined ? { primary } : {}),
+      ...(secondary !== undefined ? { secondary } : {}),
       ...(snapshot.planType !== undefined ? { plan: snapshot.planType } : {}),
     });
   }
@@ -344,6 +380,13 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
 
     const usage = this.#turnUsage();
     const status = turn.status === "inProgress" ? "failed" : turn.status;
+    const text = this.#turnText;
+    this.#turnText = null;
+    // Only a genuine usage-limit hit spends the budget #maybeRetryLimit checks; any other
+    // outcome — a success, a Stop, an unrelated failure — means the limit incident that
+    // budget belonged to is over, so the next one starts with a fresh MAX_LIMIT_RETRIES.
+    const limitHit = status === "failed" && !!turn.error && isUsageLimitError(turn.error.message);
+    if (!limitHit) this.#limitRetries = 0;
     this.#sink.emit("turn.completed", {
       turnId: turn.id,
       status,
@@ -351,6 +394,27 @@ export class CodexThreadSession implements ProviderSession, ThreadHandler {
       ...(turn.error ? { error: turn.error.message } : {}),
     });
     for (const resolve of this.#turnWaiters.splice(0)) resolve();
+    if (limitHit && turn.error) this.#maybeRetryLimit(turn.error.message, text);
+  }
+
+  /**
+   * A turn that failed on the plan's usage limit is sent again by itself once the limit's
+   * own reset has had a minute to land — over the app-server protocol Codex has no such
+   * wait of its own (the interactive CLI's is not part of it), so the host supplies it,
+   * the same as for Claude. Skipped when there is nothing to resend (a compaction, or a
+   * turn Codex began itself), this run's budget is spent (MAX_LIMIT_RETRIES), or neither
+   * the plan's reported windows nor the error's own "try again at" gives a time to wait
+   * for. Done after the turn is announced as ended, so the wait shows as `rate_limited`
+   * on top of an idle session rather than in the middle of a running one.
+   */
+  #maybeRetryLimit(errorText: string, text: string | null): void {
+    if (text === null) return;
+    if (this.#limitRetries >= MAX_LIMIT_RETRIES) return;
+    const now = Date.now();
+    const retryAt = resolveRetryAt({ limits: this.#limits, errorText, now, afterResetMs: this.#limitRetryAfterReset });
+    if (retryAt === null) return;
+    this.#limitRetries++;
+    this.#sink.retryLater(Math.max(retryAt - now, 0), { text }, { reason: errorText, retryAt });
   }
 
   #turnUsage(): Usage | undefined {

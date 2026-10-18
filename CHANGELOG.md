@@ -3,6 +3,17 @@
 All three packages (`@termlink/cli`, `@termlink/protocol`, `@termlink/terminal`) share one
 version number.
 
+## 0.1.7 - 2026-10-17
+
+- Codex sessions: a turn that fails on the plan's usage limit ("You've hit your usage
+  limit ... try again at 6:54 PM") is sent again by itself a minute past the reset,
+  as Claude sessions already were. While it waits the session is `rate_limited` and
+  `SessionInfo.rateLimit` carries the reason and the time, so a client that reconnects
+  hours later still sees it. The reset comes from Codex's own usage windows
+  (`account/rateLimits/updated`, the window at 100%) when it has reported them, and from
+  the "try again at" in the error otherwise, read in the host machine's own time zone.
+  Any send, or Stop, cancels the wait; five limit hits in a row stop it.
+
 ## 0.1.6 - 2026-10-03
 
 Three things Codex was already reporting, and one it already knew how to do, that

@@ -1,6 +1,7 @@
 // Stand-in for `codex app-server` in tests. Speaks the same newline-delimited JSON-RPC and
 // plays one scripted turn per turn/start: a streamed message, a plan, and a command that
-// needs approval. A prompt containing "fail" ends the turn with an error instead.
+// needs approval. A prompt containing "fail" ends the turn with an error instead, and one
+// containing "limit-once" / "limit-always" with the plan's usage-limit error.
 // Finished turns are kept for thread/turns/list; with FAKE_CODEX_STATE set they are
 // stored in that file, so a later process (a restarted host) can read them back.
 import { readFileSync, writeFileSync } from "node:fs";
@@ -22,6 +23,8 @@ const notify = (method: string, params: object): void => send({ method, params }
 
 const answers = new Map<number, (result: unknown) => void>();
 const turnsByThread = new Map<string, number>();
+/** Threads whose first "limit-once" turn has already failed on the usage limit. */
+const limitedThreads = new Set<string>();
 const statePath = process.env.FAKE_CODEX_STATE;
 let memoryHistory: Record<string, object[]> = {};
 let nextRequestId = 900;
@@ -90,6 +93,29 @@ async function runTurn(threadId: string, turnId: string, text: string): Promise<
   if (text.includes("fail")) {
     notify("error", { ...base, error: { message: "model unavailable" }, willRetry: false });
     finish("failed", "model unavailable");
+    return;
+  }
+
+  // "limit-always" fails on the plan's usage limit every time; "limit-once" the first time
+  // only, so the host's automatic resend of the same message goes through. "limit-noreset"
+  // reports no usage windows, so the host has only the sentence to read the reset from.
+  const limited = text.includes("limit-always") || (text.includes("limit-once") && !limitedThreads.has(threadId));
+  if (limited) {
+    limitedThreads.add(threadId);
+    // Codex reports it in whole seconds; floored, so it lands between 0 and 1s from now.
+    const resetsAt = Math.floor(Date.now() / 1000) + 1;
+    if (!text.includes("limit-noreset")) {
+      notify("account/rateLimits/updated", {
+        rateLimits: {
+          primary: { usedPercent: 100, windowDurationMins: 300, resetsAt },
+          secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: resetsAt + 86_400 },
+        },
+      });
+    }
+    const message =
+      "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 6:54 PM.";
+    notify("error", { ...base, error: { message }, willRetry: false });
+    finish("failed", message);
     return;
   }
 

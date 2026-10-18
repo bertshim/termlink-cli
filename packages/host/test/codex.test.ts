@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { AgentEvent, type EventOf } from "@termlink/protocol";
 import { mapItem } from "../src/providers/codex/mapper.js";
+import { MAX_LIMIT_RETRIES } from "../src/providers/codex/rate-limit.js";
 import type { ThreadItem } from "../src/providers/codex/protocol.js";
 import { CodexProvider } from "../src/providers/codex/provider.js";
 import { JsonRpcPeer, NO_RESPONSE, RpcError } from "../src/providers/codex/rpc.js";
@@ -104,6 +105,141 @@ test("a failed Codex turn reports the error", async () => {
     assert.equal(done.payload.status, "failed");
     assert.equal(done.payload.error, "model unavailable");
     assert.equal(rec.items.find(isType("error"))?.payload.message, "model unavailable");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+async function openLimited(afterResetMs: number) {
+  const manager = new SessionManager({ providers: [new CodexProvider({ command, limitRetryAfterResetMs: afterResetMs })] });
+  const session = await manager.createAgent({ provider: "codex", cwd: tmpdir() });
+  const rec = new Recorder();
+  session.attach(rec.push);
+  return { manager, session, rec };
+}
+
+/** The user messages of a recorded run, one per turn that reached Codex. */
+function userTexts(events: AgentEvent[]): string[] {
+  return completed(events).flatMap((i) => (i.kind === "message" && i.role === "user" ? [i.text] : []));
+}
+
+test("a Codex turn that hits the usage limit is shown as rate_limited, then auto-resent past the reset", async () => {
+  const { manager, session, rec } = await openLimited(20);
+  try {
+    await session.send({ text: "limit-once please" });
+    const failed = (await rec.waitFor(isType("turn.completed"))) as EventOf<"turn.completed">;
+    assert.equal(failed.payload.status, "failed");
+    assert.match(failed.payload.error ?? "", /hit your usage limit/);
+    // The wait is session state, not a one-shot event: readable straight off session.info.
+    assert.equal(session.info.status, "rate_limited");
+    assert.match(session.info.rateLimit?.reason ?? "", /hit your usage limit/);
+    assert.ok((session.info.rateLimit?.retryAt ?? 0) > Date.now());
+
+    // The resent turn runs the fake's normal script, which stops at a command approval.
+    const from = rec.items.length;
+    const required = (await rec.waitFor(isType("input.required"), from)) as EventOf<"input.required">;
+    assert.equal(session.info.rateLimit, undefined);
+    session.respond(required.payload.request.requestId, "accept");
+    const done = (await rec.waitFor(
+      (e) => e.type === "turn.completed" && e.payload.status === "completed",
+      from,
+    )) as EventOf<"turn.completed">;
+    assert.equal(done.payload.status, "completed");
+    assert.equal(session.info.status, "idle");
+    // One message, sent to Codex twice — the second turn opened by the host, not a person.
+    assert.deepEqual(userTexts(rec.items), ["limit-once please", "limit-once please"]);
+    assert.equal(rec.items.filter(isType("turn.started")).length, 2);
+    for (const event of rec.items) AgentEvent.parse(event);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("a Codex usage limit hit again and again stops auto-retrying at MAX_LIMIT_RETRIES", async () => {
+  const { manager, session, rec } = await openLimited(5);
+  try {
+    await session.send({ text: "limit-always please" });
+    // Each wait is the fake's own one-second reset, so the whole chain takes about MAX seconds.
+    const start = Date.now();
+    while (rec.items.filter(isType("turn.completed")).length < MAX_LIMIT_RETRIES + 1) {
+      if (Date.now() - start > 20_000) throw new Error("timed out waiting for the retry chain to give up");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const completions = rec.items.filter(isType("turn.completed"));
+    assert.equal(completions.length, MAX_LIMIT_RETRIES + 1);
+    assert.ok(completions.every((e) => e.payload.status === "failed"));
+    // Gave up, rather than waiting on one more reset forever.
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("with no usage windows reported, the sentence's own 'try again at' sets the wait", async () => {
+  const { manager, session, rec } = await openLimited(5_000);
+  try {
+    await session.send({ text: "limit-noreset limit-once" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+    const retryAt = session.info.rateLimit?.retryAt ?? 0;
+    // The next 6:54 PM on this machine's clock, plus the shortened margin: never in the past,
+    // never more than a day away.
+    assert.ok(retryAt > Date.now());
+    assert.ok(retryAt <= Date.now() + 24 * 60 * 60 * 1000 + 5_000);
+    const at = new Date(retryAt - 5_000);
+    assert.equal(at.getHours(), 18);
+    assert.equal(at.getMinutes(), 54);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("a manual send while a Codex usage-limit retry is waiting cancels the wait", async () => {
+  const { manager, session, rec } = await openLimited(60_000);
+  try {
+    await session.send({ text: "limit-once please" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+
+    await session.send({ text: "something else" });
+    assert.equal(session.info.rateLimit, undefined);
+    await rec.waitFor(isType("input.required"));
+    assert.deepEqual(userTexts(rec.items), ["limit-once please", "something else"]);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("Stop while a Codex usage-limit retry is waiting cancels it, with no turn to stop", async () => {
+  const { manager, session, rec } = await openLimited(20);
+  try {
+    await session.send({ text: "limit-once please" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "rate_limited");
+
+    await session.interrupt();
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+
+    // Past when the (cancelled) retry would have fired.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal(rec.items.filter(isType("turn.completed")).length, 1);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("an unrelated Codex failure is not retried", async () => {
+  const { manager, session, rec } = await openLimited(5);
+  try {
+    await session.send({ text: "please fail" });
+    await rec.waitFor(isType("turn.completed"));
+    assert.equal(session.info.status, "idle");
+    assert.equal(session.info.rateLimit, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(rec.items.filter(isType("turn.completed")).length, 1);
   } finally {
     await manager.shutdown();
   }

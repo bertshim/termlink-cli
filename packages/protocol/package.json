@@ -1,6 +1,6 @@
 {
   "name": "@termlink/protocol",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "TermLink agent protocol: command, response and event schemas shared by host and clients",
   "type": "module",
   "exports": {

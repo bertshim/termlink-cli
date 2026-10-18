@@ -65,7 +65,7 @@ export interface EventSink {
   /**
    * Resends `input` as a fresh send() after `delayMs`, as if it had been typed
    * again — for a provider whose turn failed on something that fixes itself with
-   * time (Claude: a genuine usage-limit hit, a minute past its own reset). The host
+   * time (Claude and Codex: a genuine usage-limit hit, a minute past its own reset). The host
    * session tracks the wait as real session state (status `rate_limited`,
    * `SessionInfo.rateLimit`), not a one-shot event: it can span hours, so a client
    * that reconnects partway through must still see it. A no-op at fire time if the

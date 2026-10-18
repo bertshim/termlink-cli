@@ -26,7 +26,7 @@ export const TERMINAL_PROVIDER = "terminal" as const;
  * `interrupting`: Stop was pressed and the turn has not ended yet (agent sessions).
  * `rate_limited`: a turn failed on the plan's own usage limit and the host is waiting
  * out `SessionInfo.rateLimit.retryAt` before trying it again on its own (agent
- * sessions, Claude only for now — see PROTOCOL.md "Rate limits").
+ * sessions, Claude and Codex — see PROTOCOL.md "Rate limits").
  */
 export const SessionStatus = z.enum(["starting", "idle", "running", "waiting_input", "interrupting", "rate_limited", "closed"]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
